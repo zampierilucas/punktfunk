@@ -435,6 +435,7 @@ struct FrameQueue {
     skipped_total: u64,
     /// The same skips over the whole session.
     skipped_ever: u64,
+    superseded: Vec<u32>,
     /// A NACK in flight: frames after this one wait until it completes or `until`.
     hold: Option<Hold>,
     /// Holds released by their frame completing, since the last [`FrameChannel::take_filled`].
@@ -468,6 +469,7 @@ impl FrameChannel {
                 all_intra: false,
                 skipped_total: 0,
                 skipped_ever: 0,
+                superseded: Vec::new(),
                 hold: None,
                 filled: 0,
                 kicked: false,
@@ -514,6 +516,10 @@ impl FrameChannel {
     pub(crate) fn take_skipped(&self) -> u64 {
         let mut st = self.inner.lock().unwrap();
         std::mem::take(&mut st.skipped_total)
+    }
+
+    pub(crate) fn take_superseded(&self) -> Vec<u32> {
+        std::mem::take(&mut self.inner.lock().unwrap().superseded)
     }
 
     /// All-intra skips this session. Monotonic.
@@ -645,7 +651,8 @@ impl FrameChannel {
             st.skipped_total += (st.q.len() - 1) as u64;
             st.skipped_ever += (st.q.len() - 1) as u64;
             let newest = st.q.pop_back().expect("len > 1");
-            st.q.clear();
+            let skipped: Vec<u32> = st.q.drain(..).map(|f| f.frame_index).collect();
+            st.superseded.extend(skipped);
             return FramePop::Frame(newest);
         }
         if let Some(f) = st.q.pop_front() {
@@ -781,6 +788,8 @@ mod frame_channel_tests {
         assert_eq!(ch.depth(), 0);
         assert_eq!(ch.take_skipped(), 2);
         assert_eq!(ch.take_skipped(), 0);
+        assert_eq!(ch.take_superseded(), vec![1, 2]);
+        assert!(ch.take_superseded().is_empty());
         ch.push(frame(4));
         assert_eq!(popped(&ch), Some(4));
         assert_eq!(ch.take_skipped(), 0);

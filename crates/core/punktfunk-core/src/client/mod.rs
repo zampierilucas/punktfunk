@@ -1540,6 +1540,10 @@ impl NativeClient {
                     self.shared.streamed.store(true, Ordering::Relaxed);
                 }
                 pump::anchor::mark(&self.shared, &mut f);
+                for index in self.shared.frames.take_superseded() {
+                    let (_, ask) = self.shared.recovery.lock().unwrap().observe(index, Instant::now());
+                    send_recovery(&self.shared, ask);
+                }
                 let completes_au = f.part.as_ref().is_none_or(|p| p.last);
                 self.hud
                     .note_received(f.pts_ns, f.received_ns, f.data.len(), completes_au);
