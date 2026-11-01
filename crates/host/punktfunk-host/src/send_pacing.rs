@@ -534,6 +534,7 @@ impl CaptureCredit {
     /// At most this many frames may follow a stall back-to-back. One frame of
     /// instant catch-up plus the floor's own headroom.
     pub(crate) const CAP: f32 = 1.25;
+    const ACCRUAL: f32 = 1.02;
 
     pub(crate) fn new(now: Instant) -> CaptureCredit {
         CaptureCredit {
@@ -547,7 +548,7 @@ impl CaptureCredit {
     pub(crate) fn earliest(&mut self, now: Instant, interval: Duration) -> Instant {
         let secs = interval.as_secs_f32();
         if secs > 0.0 {
-            let accrued = now.duration_since(self.last).as_secs_f32() / secs;
+            let accrued = now.duration_since(self.last).as_secs_f32() / secs * Self::ACCRUAL;
             self.credit = (self.credit + accrued).min(Self::CAP);
         }
         self.last = now;
@@ -1098,14 +1099,14 @@ mod tests {
         // 120 grabs span no less than (120 - 1 - CAP) intervals.
         let span = grabs[119].duration_since(grabs[0]);
         assert!(
-            span >= interval.mul_f32(120.0 - 1.0 - CaptureCredit::CAP),
+            span >= interval.mul_f32((120.0 - 1.0 - CaptureCredit::CAP) / CaptureCredit::ACCRUAL),
             "span {span:?} admits more than CAP frames of overshoot"
         );
         // Steady state is the interval, not 0.9 × interval.
         for w in grabs[20..].windows(2) {
             let gap = w[1].duration_since(w[0]);
             assert!(
-                gap >= interval.mul_f32(0.999) && gap <= interval.mul_f32(1.001),
+                gap >= interval.mul_f32(0.999 / CaptureCredit::ACCRUAL) && gap <= interval.mul_f32(1.001),
                 "steady-state gap {gap:?} != interval {interval:?}"
             );
         }
@@ -1159,7 +1160,7 @@ mod tests {
             "second post-stall grab spent more than the burst cap"
         );
         assert!(
-            after[2].duration_since(after[1]) >= interval.mul_f32(0.999),
+            after[2].duration_since(after[1]) >= interval.mul_f32(0.999 / CaptureCredit::ACCRUAL),
             "third post-stall grab must be back on the interval grid"
         );
     }
