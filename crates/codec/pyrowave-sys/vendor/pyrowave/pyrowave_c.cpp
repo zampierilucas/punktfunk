@@ -986,6 +986,8 @@ bool WrappedViewBuffers::wrap(Device *device, const pyrowave_gpu_buffers *buffer
 {
 	for (int i = 0; i < 3; i++)
 	{
+		if (i == 2 && !buffers->planes[i].image)
+			continue;
 		if (!wrap_view(device, buffers->planes[i], wrapped_images[i], image_views[i], usage))
 			return false;
 		planes[i] = image_views[i].get();

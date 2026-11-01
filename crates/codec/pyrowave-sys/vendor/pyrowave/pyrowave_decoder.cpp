@@ -32,6 +32,21 @@ struct Decoder::Impl final : public WaveletBuffers
 	bool need_image_transition = true;
 
 	std::vector<uint32_t> dequant_offset_buffer_cpu;
+	std::vector<uint8_t> block_dirty;
+	bool zero_once = getenv("PYROWAVE_ZERO_ONCE") && atoi(getenv("PYROWAVE_ZERO_ONCE")) != 0;
+	bool skip_bands_enabled = getenv("PYROWAVE_SKIP_BANDS") && atoi(getenv("PYROWAVE_SKIP_BANDS")) != 0;
+	bool half_output = getenv("PYROWAVE_HALF_OUTPUT") && atoi(getenv("PYROWAVE_HALF_OUTPUT")) != 0;
+	uint8_t band_skip[NumComponents][DecompositionLevels] = {};
+	bool skip_tiles_enabled = getenv("PYROWAVE_SKIP_TILES") && atoi(getenv("PYROWAVE_SKIP_TILES")) != 0;
+	BufferHandle tile_flag_buffer;
+	std::vector<uint32_t> tile_flags_cpu;
+	uint32_t tile_flag_offset[NumComponents][DecompositionLevels] = {};
+	uint32_t tile_flag_words[DecompositionLevels] = {};
+	bool tile_use[NumComponents][DecompositionLevels] = {};
+	bool any_tile_use = false;
+	void update_tile_flags();
+	bool wavelet_images_initialized = false;
+	bool use_idwt_shuf() const;
 	std::vector<uint32_t> payload_data_cpu;
 	// PUNKTFUNK (patch 0011): see Decoder::set_payload_memory. A wrapped image has no
 	// default view, so the views sit beside it.
@@ -56,6 +71,8 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	bool dequant(CommandBuffer &cmd);
 	bool idwt(CommandBuffer &cmd, const ViewBuffers &views);
+	bool is_nv12(const ViewBuffers &views) const;
+	ImageHandle nv12_cb;
 	bool idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views);
 	void init_block_meta() override;
 	void clear();
@@ -314,6 +331,7 @@ void Decoder::Impl::init_block_meta()
 	dequant_offset_buffer = device->create_buffer(info);
 	device->set_name(*dequant_offset_buffer, "meta-buffer");
 	dequant_offset_buffer_cpu.resize(block_count_32x32);
+	block_dirty.assign(block_count_32x32, 1);
 
 	payload_data_cpu.reserve(1024 * 1024);
 }
@@ -349,18 +367,20 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 	cmd.begin_region("DWT dequant");
 	auto start_dequant = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-	cmd.image_barrier(*wavelet_img_high_res, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-	                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+	cmd.image_barrier(*wavelet_img_high_res, wavelet_images_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+	                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
 	                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 	                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
 	if (wavelet_img_low_res)
 	{
-		cmd.image_barrier(*wavelet_img_low_res, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+		cmd.image_barrier(*wavelet_img_low_res, wavelet_images_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
 		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 	}
+
+	wavelet_images_initialized = true;
 
 	// De-quantize
 	for (int level = 0; level < DecompositionLevels; level++)
@@ -370,6 +390,8 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 			// Ignore top-level CbCr when doing 420 subsampling.
 			if (level == 0 && component != 0 && chroma == ChromaSubsampling::Chroma420)
 				continue;
+			if (half_output && level == (component != 0 && chroma == ChromaSubsampling::Chroma420 ? 1 : 0))
+				continue;
 
 			char label[128];
 			snprintf(label, sizeof(label), "level %d - component %d", level, component);
@@ -377,6 +399,9 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 
 			for (int band = (level == DecompositionLevels - 1 ? 0 : 1); band < 4; band++)
 			{
+				if (band != 0 && (band_skip[component][level] & (1u << (band - 1))))
+					continue;
+
 				push.resolution.x = wavelet_img_high_res->get_width(level);
 				push.resolution.y = wavelet_img_high_res->get_height(level);
 				push.output_layer = band;
@@ -744,10 +769,215 @@ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
 	return true;
 }
 
+bool Decoder::Impl::use_idwt_shuf() const
+{
+	return shaders.idwt_shuf && Configuration::get().get_precision() == 0 &&
+	       device->supports_subgroup_size_log2(true, 3, 3) && !getenv("PYROWAVE_IDWT_SHARED");
+}
+
+void Decoder::Impl::update_tile_flags()
+{
+	const int R = 16;
+	if (!tile_flag_buffer)
+	{
+		uint32_t align = std::max<uint32_t>(
+				1u, uint32_t(device->get_gpu_properties().limits.minStorageBufferOffsetAlignment / sizeof(uint32_t)));
+		uint32_t total = 0;
+		for (int level = 0; level < DecompositionLevels; level++)
+		{
+			int w = component_layer_views[0][level]->get_view_width();
+			int h = component_layer_views[0][level]->get_view_height();
+			tile_flag_words[level] = uint32_t(((h + R - 1) / R) * (((2 * w + 23) / 24 + 7) / 8));
+			for (int c = 0; c < NumComponents; c++)
+			{
+				tile_flag_offset[c][level] = total;
+				total += (tile_flag_words[level] + align - 1) / align * align;
+			}
+		}
+		tile_flags_cpu.assign(total, ~0u);
+
+		BufferCreateInfo info;
+		info.domain = BufferDomain::Device;
+		info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		info.size = total * sizeof(uint32_t);
+		tile_flag_buffer = device->create_buffer(info);
+		device->set_name(*tile_flag_buffer, "tile-flags");
+	}
+
+	static const float min_skip = getenv("PYROWAVE_TILE_MIN") ? float(atof(getenv("PYROWAVE_TILE_MIN"))) : 0.15f;
+	any_tile_use = false;
+
+	for (int level = 0; level < DecompositionLevels; level++)
+	{
+		int w = component_layer_views[0][level]->get_view_width();
+		int h = component_layer_views[0][level]->get_view_height();
+		int gx = (h + R - 1) / R;
+		int gy = ((2 * w + 23) / 24 + 7) / 8;
+
+		for (int c = 0; c < NumComponents; c++)
+		{
+			tile_use[c][level] = false;
+			if (level == 0 && c != 0 && chroma == ChromaSubsampling::Chroma420)
+				continue;
+
+			uint32_t active = 7u & ~uint32_t(band_skip[c][level]);
+			if (!active)
+				continue;
+			unsigned reads = 0, skipped = 0;
+			uint32_t *out = &tile_flags_cpu[tile_flag_offset[c][level]];
+			uint64_t rows[3][64];
+			int block_rows = (h + 31) / 32;
+			if ((w + 31) / 32 > 64 || block_rows > 64)
+				continue;
+			for (int band = 1; band < 4; band++)
+			{
+				auto &meta = block_meta[c][level][band];
+				for (int by = 0; by < block_rows; by++)
+				{
+					uint64_t bits = 0;
+					const uint32_t *offs = &dequant_offset_buffer_cpu[meta.block_offset_32x32 + by * meta.block_stride_32x32];
+					for (int bx = 0; bx < meta.block_stride_32x32; bx++)
+						bits |= uint64_t(offs[bx] != UINT32_MAX) << bx;
+					rows[band - 1][by] = bits;
+				}
+			}
+			for (int wx = 0; wx < gx; wx++)
+			{
+				int r0 = std::max(wx * R - 2, 0) >> 5;
+				int r1 = std::min(wx * R + R + 1, h - 1) >> 5;
+				uint64_t span[3] = {};
+				for (int b = 0; b < 3; b++)
+					for (int by = r0; by <= r1; by++)
+						span[b] |= rows[b][by];
+				for (int wy = 0; wy < gy; wy++)
+				{
+					uint32_t word = 0;
+					for (int s = 0; s < 8; s++)
+					{
+						int tx = wy * 8 + s;
+						int c0 = std::max(tx * 12 - 2, 0);
+						int c1 = std::min(tx * 12 + 13, w - 1);
+						if (c0 > c1)
+							continue;
+						c0 >>= 5;
+						c1 >>= 5;
+						uint64_t cols = ((uint64_t(2) << (c1 - c0)) - 1) << c0;
+						for (int b = 0; b < 3; b++)
+						{
+							if (!(active & (1u << b)))
+								continue;
+							reads++;
+							if (span[b] & cols)
+								word |= 1u << (3 * s + b);
+							else
+								skipped++;
+						}
+					}
+					out[wy * gx + wx] = word;
+				}
+			}
+			tile_use[c][level] = reads && float(skipped) >= min_skip * float(reads);
+			any_tile_use = any_tile_use || tile_use[c][level];
+		}
+	}
+
+	static const bool tile_stats = getenv("PYROWAVE_TILE_STATS") != nullptr;
+	static bool printed;
+	if (tile_stats && !printed)
+	{
+		printed = true;
+		for (int level = 0; level < DecompositionLevels; level++)
+		{
+			for (int c = 0; c < NumComponents; c++)
+			{
+				unsigned present[3] = {}, total = 0;
+				for (uint32_t i = 0; i < tile_flag_words[level]; i++)
+				{
+					uint32_t word = tile_flags_cpu[tile_flag_offset[c][level] + i];
+					for (int s = 0; s < 8; s++)
+					{
+						total++;
+						for (int b = 0; b < 3; b++)
+							present[b] += (word >> (3 * s + b)) & 1u;
+					}
+				}
+				LOGI("tiles L%d c%d skipmask %x use %d: present %u/%u/%u of %u\n", level, c, band_skip[c][level],
+				     int(tile_use[c][level]), present[0], present[1], present[2], total);
+			}
+		}
+	}
+}
+
+bool Decoder::Impl::is_nv12(const ViewBuffers &views) const
+{
+	return !views.planes[2] && chroma == ChromaSubsampling::Chroma420 && use_idwt_shuf() &&
+	       shaders.idwt_shuf_merge[0] && views.planes[1]->get_format() == VK_FORMAT_R32_UINT;
+}
+
 bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 {
-	cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
-	cmd.enable_subgroup_size_control(false);
+	const bool shuf = use_idwt_shuf();
+	const bool nv12 = is_nv12(views);
+	if (nv12 && (!nv12_cb || nv12_cb->get_height() != views.planes[1]->get_view_height()))
+	{
+		auto info = ImageCreateInfo::immutable_2d_image(views.planes[1]->get_view_width() / 2,
+		                                                views.planes[1]->get_view_height(), VK_FORMAT_R32_UINT);
+		info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		info.layout = ImageLayout::General;
+		nv12_cb = device->create_image(info);
+	}
+	if (nv12)
+		cmd.image_barrier(*nv12_cb, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+		                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+	bool packed[NumComponents];
+	for (int c = 0; c < NumComponents; c++)
+	{
+		packed[c] = nv12 || views.planes[c]->get_format() == VK_FORMAT_R32_UINT;
+		if (packed[c] && !shuf)
+			return false;
+	}
+	auto select_program = [&](int c, int level, bool final_out = false) {
+		if (!shuf)
+			return;
+		const bool pk = final_out && packed[c];
+		if (final_out && nv12 && c == 2)
+		{
+			cmd.set_texture(0, 3, nv12_cb->get_view(), StockSampler::NearestClamp);
+			if (tile_use[c][level])
+			{
+				cmd.set_program(shaders.idwt_shuf_merge_tile[band_skip[c][level]]);
+				cmd.set_storage_buffer(0, 2, *tile_flag_buffer, tile_flag_offset[c][level] * sizeof(uint32_t),
+				                       tile_flag_words[level] * sizeof(uint32_t));
+			}
+			else
+				cmd.set_program(shaders.idwt_shuf_merge[band_skip[c][level]]);
+		}
+		else if (tile_use[c][level])
+		{
+			cmd.set_program(pk ? shaders.idwt_shuf_packed_tile[band_skip[c][level]] : shaders.idwt_shuf_tile[band_skip[c][level]]);
+			cmd.set_storage_buffer(0, 2, *tile_flag_buffer, tile_flag_offset[c][level] * sizeof(uint32_t),
+			                       tile_flag_words[level] * sizeof(uint32_t));
+		}
+		else if (pk)
+			cmd.set_program(shaders.idwt_shuf_packed[band_skip[c][level]]);
+		else
+			cmd.set_program(band_skip[c][level] ? shaders.idwt_shuf_skip[band_skip[c][level]] : shaders.idwt_shuf);
+	};
+	if (shuf)
+	{
+		cmd.set_program(shaders.idwt_shuf);
+		cmd.enable_subgroup_size_control(true);
+		cmd.set_subgroup_size_log2(true, 3, 3);
+	}
+	else
+	{
+		cmd.set_program(shaders.idwt[Configuration::get().get_precision()]);
+		cmd.enable_subgroup_size_control(false);
+	}
+	auto groups_y = [shuf](int res_y) { return shuf ? ((2 * res_y + 23) / 24 + 7) / 8 : (res_y + 15) / 16; };
 
 	auto start_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
@@ -757,7 +987,8 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		vec2 inv_resolution;
 	} push = {};
 
-	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
+	const int lowest_level = half_output ? 1 : 0;
+	for (int input_level = DecompositionLevels - 1; input_level >= lowest_level; input_level--)
 	{
 		// Transposed.
 		push.resolution.x = component_layer_views[0][input_level]->get_view_height();
@@ -780,7 +1011,8 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 					cmd.begin_region(label);
 					cmd.set_storage_texture(0, 1, *views.planes[c]);
 					cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
-					cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+					select_program(c, input_level, true);
+					cmd.dispatch((push.resolution.x + 15) / 16, groups_y(push.resolution.y), 1);
 					cmd.end_region();
 				}
 			}
@@ -789,7 +1021,8 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 				cmd.set_storage_texture(0, 1, *views.planes[0]);
 				cmd.begin_region("iDWT final");
 				cmd.set_texture(0, 0, *component_layer_views[0][input_level], *mirror_repeat_sampler);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+				select_program(0, input_level, true);
+				cmd.dispatch((push.resolution.x + 15) / 16, groups_y(push.resolution.y), 1);
 				cmd.end_region();
 			}
 		}
@@ -797,20 +1030,31 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		{
 			for (int c = 0; c < NumComponents; c++)
 			{
+				const int final_level = (chroma == ChromaSubsampling::Chroma420 && c != 0 ? 1 : 0) + (half_output ? 1 : 0);
+				if (input_level < final_level)
+					continue;
+
 				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
 
-				if (chroma == ChromaSubsampling::Chroma420 && c != 0 && input_level == 1)
+				if (input_level == final_level)
 				{
-					cmd.set_storage_texture(0, 1, *views.planes[c]);
+					if (nv12 && c == 2)
+						cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+						            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+					cmd.set_storage_texture(0, 1, nv12 && c == 1 ? nv12_cb->get_view() : *views.planes[nv12 ? 1 : c]);
 					cmd.set_specialization_constant(0, true);
 				}
 				else
+				{
 					cmd.set_storage_texture(0, 1, *component_ll_views[c][input_level - 1]);
+					cmd.set_specialization_constant(0, false);
+				}
 
 				char label[64];
 				snprintf(label, sizeof(label), "iDWT level %u, component %u", input_level - 1, c);
 				cmd.begin_region(label);
-				cmd.dispatch((push.resolution.x + 15) / 16, (push.resolution.y + 15) / 16, 1);
+				select_program(c, input_level, input_level == final_level);
+				cmd.dispatch((push.resolution.x + 15) / 16, groups_y(push.resolution.y), 1);
 				cmd.end_region();
 			}
 		}
@@ -819,6 +1063,9 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
 		cmd.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
 		            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 	}
+
+	if (shuf)
+		cmd.enable_subgroup_size_control(false);
 
 	auto end_idwt = cmd.write_timestamp(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	device->register_time_interval("GPU", std::move(start_idwt), std::move(end_idwt), "iDWT");
@@ -919,18 +1166,78 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 			return false;
 		}
 
-		memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
-		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
-		       dequant_offset_buffer_cpu.data(), dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front()));
+		auto *offsets = static_cast<uint32_t *>(cmd.update_buffer(*dequant_offset_buffer, 0,
+		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())));
+		const bool skip_bands = skip_bands_enabled && !fragment_path && use_idwt_shuf();
+		for (int c = 0; c < NumComponents; c++)
+		{
+			for (int level = 0; level < DecompositionLevels; level++)
+			{
+				band_skip[c][level] = 0;
+				for (int band = 0; band < 4; band++)
+				{
+					auto &meta = block_meta[c][level][band];
+					int begin = meta.block_offset_32x32;
+					int end = begin + meta.block_count_32x32;
+					bool any = false;
+					for (int i = begin; i < end && !any; i++)
+						any = dequant_offset_buffer_cpu[i] != UINT32_MAX;
+					bool skip = skip_bands && band != 0 && !any;
+					if (skip)
+						band_skip[c][level] |= uint8_t(1u << (band - 1));
+
+					for (int i = begin; i < end; i++)
+					{
+						uint32_t offset = dequant_offset_buffer_cpu[i];
+						bool empty = offset == UINT32_MAX;
+						if (!skip)
+						{
+							if (empty && (block_dirty[i] || !zero_once))
+								offset = UINT32_MAX - 1;
+							block_dirty[i] = !empty;
+						}
+						offsets[i] = offset;
+					}
+				}
+			}
+		}
+		static const bool skip_stats = getenv("PYROWAVE_SKIP_STATS") != nullptr;
+		if (skip_stats)
+		{
+			static bool printed;
+			if (!printed)
+			{
+				printed = true;
+				for (int c = 0; c < NumComponents; c++)
+					LOGI("band skip mask c%d: L0 %x L1 %x L2 %x L3 %x L4 %x\n", c, band_skip[c][0], band_skip[c][1],
+					     band_skip[c][2], band_skip[c][3], band_skip[c][4]);
+			}
+		}
+
+		if (skip_tiles_enabled && shaders.idwt_shuf_tile[0] && !fragment_path && use_idwt_shuf())
+		{
+			update_tile_flags();
+			if (any_tile_use)
+				memcpy(cmd.update_buffer(*tile_flag_buffer, 0, tile_flags_cpu.size() * sizeof(uint32_t)),
+				       tile_flags_cpu.data(), tile_flags_cpu.size() * sizeof(uint32_t));
+		}
 
 		cmd.barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
 		            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-		            use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+		            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+		            (use_readonly_texel_buffer ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : 0));
 	}
 	cmd.end_region();
 
+	static const int stages = getenv("PYROWAVE_STAGES") ? atoi(getenv("PYROWAVE_STAGES")) : 2;
+	if (stages < 1)
+		return true;
+
 	if (!dequant(cmd))
 		return false;
+
+	if (stages < 2)
+		return true;
 
 	cmd.barrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
@@ -982,6 +1289,9 @@ void Decoder::Impl::check_linear_texture_support()
 {
 	if (!use_readonly_texel_buffer)
 		return;
+	if (const char *env = getenv("PYROWAVE_PAYLOAD"))
+		if (strcmp(env, "linear") != 0)
+			return;
 
 	// Texel buffers hit LS path on at least Mali, and most likely they hit slow paths on most mobile IHVs.
 	// Try to promote to linear 2D images instead if we can get away with it.

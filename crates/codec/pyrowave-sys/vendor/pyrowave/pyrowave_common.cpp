@@ -276,6 +276,9 @@ bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsam
 		}
 	}
 
+	if (const char *env = getenv("PYROWAVE_PAYLOAD"))
+		use_readonly_texel_buffer = strcmp(env, "ssbo") != 0;
+
 	if (use_readonly_texel_buffer)
 		LOGI("Using texel buffers instead of SSBO.\n");
 
