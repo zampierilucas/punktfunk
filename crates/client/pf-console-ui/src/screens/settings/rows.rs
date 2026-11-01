@@ -743,7 +743,7 @@ pub(super) fn codecs(
     platform: crate::platform::Platform,
 ) -> &'static [(&'static str, &'static str)] {
     match platform {
-        crate::platform::Platform::WebOS => &CODECS[..4],
+        crate::platform::Platform::WebOS => &CODECS,
         crate::platform::Platform::Tizen => &CODECS[..3],
         crate::platform::Platform::Ps5 => &CODECS_PS5,
         _ => &CODECS,
@@ -848,7 +848,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // The clients that open a window per monitor; Apple's is the Mac (`row_applies`).
         RowId::Screens => &[Desktop, Apple],
         // The clients whose dial sends `pyrowave_bpp`.
-        RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5],
+        RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5, WebOS],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],
