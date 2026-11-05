@@ -61,6 +61,33 @@ pub(crate) fn pace_factor() -> f64 {
     )
 }
 
+/// `PUNKTFUNK_PACE_LINK_MBPS`: the real link capacity. Set, the factor adapts to the stream:
+/// `min(PUNKTFUNK_PACE_MAX_FACTOR (default 3), 0.95 × link / B)`, never under 1.05. Unset,
+/// [`pace_factor`] stands.
+fn pace_link_max() -> Option<(f64, f64)> {
+    env_once!(Option<(f64, f64)>, {
+        let num = |k: &str| {
+            pf_host_config::knob(k)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|f| f.is_finite() && *f > 0.0)
+        };
+        num("PUNKTFUNK_PACE_LINK_MBPS").map(|l| (l, num("PUNKTFUNK_PACE_MAX_FACTOR").unwrap_or(3.0)))
+    })
+}
+
+/// The factor for a stream at `bitrate_kbps` ([`pace_link_max`] or [`pace_factor`]).
+fn factor_for(bitrate_kbps: u32) -> f64 {
+    match pace_link_max() {
+        Some((link, max)) => link_factor(link, max, bitrate_kbps),
+        None => pace_factor(),
+    }
+}
+
+fn link_factor(link_mbps: f64, max: f64, bitrate_kbps: u32) -> f64 {
+    let fit = 0.95 * link_mbps * 1_000.0 / f64::from(bitrate_kbps.max(1));
+    fit.min(max).max(1.05)
+}
+
 /// How a session's frames leave. `Auto` and `Wake` are what a client asks for; `Burst` and
 /// `Smooth` only `PUNKTFUNK_DELIVERY` sets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,7 +243,7 @@ impl LinkRate {
 
 /// `R`, bits/s: `min(max(f × B, 0.9 L), cap)` ([`cap_bps`]).
 pub(crate) fn rate_bps(bitrate_kbps: u32, link: &LinkRate, pinned_wall: Option<u32>) -> u64 {
-    let stream = (f64::from(bitrate_kbps) * 1_000.0 * pace_factor()) as u64;
+    let stream = (f64::from(bitrate_kbps) * 1_000.0 * factor_for(bitrate_kbps)) as u64;
     stream
         .max(u64::from(link.kbps) * 900)
         .min(cap_bps(bitrate_kbps, link, pinned_wall))
@@ -401,7 +428,7 @@ impl Pacer {
             _ => shape,
         };
         self.cap_bps = cap_bps(bitrate_kbps, &self.link, pinned_wall);
-        let stream = (f64::from(bitrate_kbps) * 1_000.0 * pace_factor()) as u64;
+        let stream = (f64::from(bitrate_kbps) * 1_000.0 * factor_for(bitrate_kbps)) as u64;
         self.base_bps = if self.shape == Shape::Smooth && stream > 0 {
             stream.min(self.cap_bps)
         } else {
@@ -821,6 +848,21 @@ mod tests {
             l(Some(940_000), asym, Some(Forced::Capped)).kbps,
             FLOOR_KBPS
         );
+    }
+
+    #[test]
+    fn link_factor_adapts_to_the_stream_rate() {
+        // 110 Mbps: 0.95 x 330 / 110 = 2.85, under the 3.0 max.
+        assert!((link_factor(330.0, 3.0, 110_000) - 2.85).abs() < 1e-9);
+        // 50 Mbps would want 6.27: clamped to the max.
+        assert_eq!(link_factor(330.0, 3.0, 50_000), 3.0);
+        // 200 Mbps: 1.5675.
+        assert!((link_factor(330.0, 3.0, 200_000) - 1.5675).abs() < 1e-9);
+        // 300 Mbps would be 1.045: floored.
+        assert_eq!(link_factor(330.0, 3.0, 300_000), 1.05);
+        // A lower max wins over the fit; a max under the floor still floors.
+        assert_eq!(link_factor(330.0, 2.0, 110_000), 2.0);
+        assert_eq!(link_factor(330.0, 1.0, 110_000), 1.05);
     }
 
     /// (a) 1 GbE both ends, 80 Mbit/s: `R` is 0.9 L and [`group_bytes`] half a millisecond.

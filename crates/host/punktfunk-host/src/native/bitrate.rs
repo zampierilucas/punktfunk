@@ -142,6 +142,24 @@ pub(super) fn resolve_bitrate_kbps(requested: u32) -> u32 {
     }
 }
 
+/// `PUNKTFUNK_PYROWAVE_MAX_MBPS_1080` (Mbps) replaces `ceiling` for a mode of at most
+/// 1920x1080 pixels; unset or zero leaves `ceiling`.
+fn ceiling_for(mode: &punktfunk_core::config::Mode, ceiling: Option<u32>) -> Option<u32> {
+    let small = pf_host_config::knob("PUNKTFUNK_PYROWAVE_MAX_MBPS_1080")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&m| m > 0)
+        .map(|m| m.saturating_mul(1000));
+    pick_ceiling(u64::from(mode.width) * u64::from(mode.height), ceiling, small)
+}
+
+fn pick_ceiling(pixels: u64, ceiling: Option<u32>, small: Option<u32>) -> Option<u32> {
+    if pixels <= 1920 * 1080 {
+        small.or(ceiling)
+    } else {
+        ceiling
+    }
+}
+
 /// The session's PyroWave bits per pixel: the client's quality
 /// ([`EXT_TAG_PYROWAVE_QUALITY`](punktfunk_core::quic::EXT_TAG_PYROWAVE_QUALITY)) held inside
 /// `[BPP_FLOOR, BPP_MAX]`, else the host's row `pyrowave_bpp`. Fixed for the session, so a
@@ -174,9 +192,9 @@ pub(super) fn resolve_bitrate_kbps_for(
         }
         let pin = punktfunk_core::pyrowave::kbps_for(mode, chroma.is_444(), bit_depth, bpp)
             .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
-        // Open-loop pin can outrun the link. `PUNKTFUNK_PYROWAVE_MAX_MBPS` caps it;
-        // unset ⇒ no cap.
-        if let Some(ceiling) = ceiling {
+        // Open-loop pin can outrun the link. `PUNKTFUNK_PYROWAVE_MAX_MBPS` caps it (or
+        // `_1080` at 1080p and below); unset ⇒ no cap.
+        if let Some(ceiling) = ceiling_for(mode, ceiling) {
             if pin > ceiling {
                 tracing::warn!(
                     pin_kbps = pin,
@@ -460,6 +478,18 @@ pub(super) fn apply_fec_target(session: &mut Session, fec_target: &AtomicU8) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pyrowave_1080_ceiling_applies_at_1080p_and_below() {
+        let (c, s) = (Some(110_000), Some(240_000));
+        assert_eq!(pick_ceiling(1920 * 1080, c, s), s);
+        assert_eq!(pick_ceiling(1280 * 720, c, s), s);
+        assert_eq!(pick_ceiling(3840 * 2160, c, s), c);
+        assert_eq!(pick_ceiling(1920 * 1081, c, s), c);
+        assert_eq!(pick_ceiling(1920 * 1080, c, None), c);
+        assert_eq!(pick_ceiling(1920 * 1080, None, s), s);
+        assert_eq!(pick_ceiling(3840 * 2160, None, s), None);
+    }
+
     use super::*;
     use crate::native::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
