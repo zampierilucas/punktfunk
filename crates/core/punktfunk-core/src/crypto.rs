@@ -380,18 +380,24 @@ impl SessionCrypto {
         Ok(at + self.open_media(seq, aad, rest)?)
     }
 
-    /// Open `wire`'s sealed body into `out`, which must be exactly that long; `wire` is left
-    /// as received. On failure `out` is unspecified.
-    pub fn open_wire_into(&self, seq: u64, wire: &[u8], out: &mut [u8]) -> Result<()> {
+    /// Open `wire`'s sealed body in place (the receive buffer is cached memory), then copy the
+    /// plaintext into `out`, which must be exactly that long. On failure `out` is untouched.
+    pub fn open_wire_into(&self, seq: u64, wire: &mut [u8], out: &mut [u8]) -> Result<()> {
         if wire.len() < self.clear + TAG_LEN {
             return Err(PunktfunkError::BadPacket);
         }
-        let (aad, rest) = wire.split_at(self.clear);
-        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
-        let tag: &[u8; TAG_LEN] = tag.try_into().map_err(|_| PunktfunkError::Crypto)?;
+        let (aad, rest) = wire.split_at_mut(self.clear);
+        let split = rest.len() - TAG_LEN;
+        if out.len() != split {
+            return Err(PunktfunkError::BadPacket);
+        }
+        let (ciphertext, tag) = rest.split_at_mut(split);
+        let tag: &[u8; TAG_LEN] = (&*tag).try_into().map_err(|_| PunktfunkError::Crypto)?;
         let key = self.recv.key(seq);
         key.cipher
-            .open_into(media_nonce(&key.iv, seq), aad, ciphertext, out, tag)
+            .open(media_nonce(&key.iv, seq), aad, ciphertext, tag)?;
+        out.copy_from_slice(ciphertext);
+        Ok(())
     }
 
     /// Seal `buf` (`plaintext ‖ TAG_LEN scratch`) as packet `seq`, binding `aad`, the packet's
