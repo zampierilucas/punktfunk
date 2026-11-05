@@ -60,6 +60,8 @@ pub struct Frame {
     /// leaves 0 (it has no clock). Do not stamp at the pre-decode pull — that folds queue
     /// wait into apparent network latency.
     pub received_ns: u64,
+    /// Same clock as `received_ns`: when the AU's first packet arrived. 0 when unknown.
+    pub first_ns: u64,
     /// `Some` on the first frame handed out under a format other than the one before it: build
     /// the decoder for this format before decoding this frame. Set by
     /// [`NativeClient::next_frame`](crate::client::NativeClient::next_frame), only under

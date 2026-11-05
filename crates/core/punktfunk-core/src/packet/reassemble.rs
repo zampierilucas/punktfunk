@@ -87,6 +87,8 @@ struct FrameBuf {
     blocks_ok: usize,
     /// A block's last shard arrived and parity could not close it. Reported once.
     short_tail: bool,
+    /// CLOCK_REALTIME ns when the frame's first packet opened it.
+    first_ns: u64,
 }
 
 /// Per-session header bounds, applied before any allocation. Derived from [`Config`].
@@ -612,6 +614,7 @@ impl Reassembler {
                     blocks: HashMap::new(),
                     blocks_ok: 0,
                     short_tail: false,
+                    first_ns: crate::quic::wall_clock_ns(),
                 })
             }
         };
@@ -1207,6 +1210,7 @@ fn hand_up_partial(
             complete: false,
             part: None,
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            first_ns: f.first_ns,
             new_format: None,
         });
     }
@@ -1281,6 +1285,7 @@ impl FrameBuf {
             complete: true,
             part,
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            first_ns: self.first_ns,
             new_format: None,
         }
     }
@@ -1327,6 +1332,7 @@ impl FrameBuf {
                 last: false,
             }),
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            first_ns: self.first_ns,
             new_format: None,
         })
     }
@@ -1453,6 +1459,7 @@ mod reset_tests {
             complete: false,
             part: None,
             received_ns: 0,
+            first_ns: 0,
             new_format: None,
         });
         r.reset();

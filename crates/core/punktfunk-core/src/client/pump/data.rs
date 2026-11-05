@@ -594,6 +594,7 @@ mod tests {
             complete: true,
             part: None,
             received_ns: 0,
+            first_ns: 0,
             new_format: None,
         }
     }
