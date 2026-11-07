@@ -147,6 +147,8 @@ struct PerfWindow {
     submit_us: Vec<u32>,
     wait_us: Vec<u32>,
     queue_us: Vec<u32>,
+    pick_us: Vec<u32>,
+    hostt_us: Vec<u32>,
     driver: crate::stats_recorder::DriverStages,
     paced: u64,
     immediate: u64,
@@ -390,6 +392,17 @@ pub(super) fn send_loop(
     probe_seq: bool,
 ) {
     pf_frame::thread_qos::boost_thread_priority(false);
+    #[cfg(target_os = "linux")]
+    {
+        let prio = std::env::var("PUNKTFUNK_SEND_RT")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(10);
+        if prio > 0 {
+            let ok = pf_frame::thread_qos::make_thread_realtime(prio.min(20));
+            tracing::info!(prio, ok, "send thread SCHED_RR");
+        }
+    }
     let wire = WireLine::new(stats.wire_sock.take());
     let mut session = session;
     session.tap_plaintext(true);
@@ -405,6 +418,7 @@ pub(super) fn send_loop(
         shard_rx,
         timing_conn,
         probe_seq,
+        pick_us: 0,
         pacer: crate::send_pacing::Pacer::new(stats.ports, crate::send_pacing::forced()),
         ring: ResendRing::default(),
         link: None,
@@ -459,6 +473,7 @@ struct SendLoop {
     stats: SendStats,
     timing_conn: Option<crate::native::link::SessionLink>,
     probe_seq: bool,
+    pick_us: u32,
     pacer: crate::send_pacing::Pacer,
     /// The last frames' plaintext, for a client's NACK.
     ring: ResendRing,
@@ -614,6 +629,10 @@ impl SendLoop {
                 tracing::warn!("streamed AU abandoned mid-flight — client ages it out");
             }
         }
+        self.pick_us = match &send_msg {
+            SendMsg::Frame(f) => (now_ns().saturating_sub(f.meta.capture_ns) / 1000) as u32,
+            _ => self.pick_us,
+        };
         let outcome = match send_msg {
             SendMsg::Frame(FrameMsg { data, meta: m }) => paced_submit(
                 &mut self.session,
@@ -697,6 +716,8 @@ impl SendLoop {
         };
         self.send_spread_us.store(next, Ordering::Relaxed);
         if self.perf || self.stats.rec.is_armed() {
+            self.perf_line.win.pick_us.push(self.pick_us);
+            self.perf_line.win.hostt_us.push(host_us);
             self.perf_line
                 .win
                 .record(m, stat, (!probe).then_some(host_us));
@@ -795,6 +816,9 @@ impl PerfLine {
                 send_dropped_total = s.packets_send_dropped,
                 encode_us_p50 = percentile(&mut win.encode_us, 0.50),
                 encode_us_p99 = percentile(&mut win.encode_us, 0.99),
+                pickup_us_p50 = percentile(&mut win.pick_us, 0.50),
+                pickup_us_max = percentile(&mut win.pick_us, 1.0),
+                host_us_p50 = percentile(&mut win.hostt_us, 0.50),
                 pace_us_p50 = percentile(&mut win.pace_us, 0.50),
                 pace_us_p99 = percentile(&mut win.pace_us, 0.99),
                 pace_us_max = win.pace_us.last().copied().unwrap_or(0),

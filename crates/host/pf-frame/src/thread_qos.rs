@@ -69,6 +69,35 @@ pub fn boost_thread_priority(critical: bool) {
     }
 }
 
+/// Best-effort SCHED_RR at `prio` for the calling thread, for the paced send thread: under a
+/// CPU-saturating load nice -5 still queues it behind runnable game threads and a standing
+/// backlog of whole frames builds in front of the pacer. Direct `sched_setscheduler` first
+/// (CAP_SYS_NICE / RLIMIT_RTPRIO), else RealtimeKit with an RLIMIT_RTTIME it requires. A
+/// thread that spins past the RTTIME limit is killed by the kernel; the send thread sleeps
+/// between groups, far below it. Returns whether the thread is now realtime.
+#[cfg(target_os = "linux")]
+pub fn make_thread_realtime(prio: i32) -> bool {
+    // SAFETY: `sched_param` is a plain C struct we fully initialise, passed by pointer to a
+    // call that only reads it; pid 0 is the calling thread.
+    let direct = unsafe {
+        let mut p: libc::sched_param = std::mem::zeroed();
+        p.sched_priority = prio;
+        libc::sched_setscheduler(0, libc::SCHED_RR, &p) == 0
+    };
+    if direct {
+        return true;
+    }
+    let lim = libc::rlimit {
+        rlim_cur: 150_000,
+        rlim_max: 150_000,
+    };
+    // SAFETY: `lim` is a valid, initialised rlimit read by the call.
+    if unsafe { libc::setrlimit(libc::RLIMIT_RTTIME, &lim) } != 0 {
+        return false;
+    }
+    linux_rtkit::make_realtime(prio).is_ok()
+}
+
 /// `(policy, rt_priority, nice)` for the calling thread.
 ///
 /// A boost we asked for and a boost the hot thread has are different
@@ -137,6 +166,22 @@ mod linux_rtkit {
             Some("org.freedesktop.RealtimeKit1"),
             "MakeThreadHighPriorityWithPID",
             &(pid, tid, nice),
+        )?;
+        Ok(())
+    }
+
+    /// `MakeThreadRealtimeWithPID(u64 process, u64 thread, u32 priority)`: SCHED_RR.
+    pub(super) fn make_realtime(prio: i32) -> Result<(), zbus::Error> {
+        // SAFETY: `gettid` takes no arguments and returns the calling thread's tid.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        let pid = u64::from(std::process::id());
+        let conn = zbus::blocking::Connection::system()?;
+        conn.call_method(
+            Some("org.freedesktop.RealtimeKit1"),
+            "/org/freedesktop/RealtimeKit1",
+            Some("org.freedesktop.RealtimeKit1"),
+            "MakeThreadRealtimeWithPID",
+            &(pid, tid, prio as u32),
         )?;
         Ok(())
     }

@@ -1222,7 +1222,12 @@ fn start_send(
     super::send::SendThread,
     Arc<std::sync::mpsc::SyncSender<SendMsg>>,
 )> {
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(3);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<SendMsg>(
+        std::env::var("PUNKTFUNK_SEND_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(if codec == crate::encode::Codec::PyroWave { 1 } else { 3 }),
+    );
     let frame_tx = Arc::new(frame_tx);
     let nack_tx = Arc::downgrade(&frame_tx);
     *wiring.resend.lock().unwrap_or_else(|e| e.into_inner()) =
