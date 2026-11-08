@@ -213,6 +213,11 @@ fn reclaim_parity(
     }
 }
 
+/// Opt-in: sees each chunk-aligned first-screen video data shard as it lands, before its AU
+/// completes (frame index, shard bytes). Set once per process.
+// ponytail: process-global hook for a measurement; a per-session callback for upstream.
+pub static SHARD_TAP: std::sync::OnceLock<fn(u32, &[u8])> = std::sync::OnceLock::new();
+
 pub struct Reassembler {
     limits: ReassemblerLimits,
     /// The host instant the session's capture times count from.
@@ -733,6 +738,11 @@ impl Reassembler {
                     }
                     block.have_data[g.shard_index] = true;
                     block.data_received += 1;
+                    if primary && hdr.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+                        if let Some(tap) = SHARD_TAP.get() {
+                            tap(hdr.frame_index, &buf[off..off + shard_bytes]);
+                        }
+                    }
                 }
             } else {
                 let Some(body) = body else {
