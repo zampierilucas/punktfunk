@@ -419,6 +419,11 @@ pub(super) fn send_loop(
         timing_conn,
         probe_seq,
         pick_us: 0,
+        stale_hold: (stats.codec == crate::encode::Codec::PyroWave.label())
+            .then(stale_hold)
+            .flatten(),
+        stale_since: None,
+        skipped: 0,
         pacer: crate::send_pacing::Pacer::new(stats.ports, crate::send_pacing::forced()),
         ring: ResendRing::default(),
         link: None,
@@ -443,7 +448,11 @@ pub(super) fn send_loop(
         };
         match frame_rx.recv_timeout(wait) {
             Ok(send_msg) => {
-                if !lp.step(send_msg) || !lp.drain_deferred() {
+                let (send_msg, after) = lp.skip_stale(send_msg, &frame_rx);
+                if !lp.step(send_msg)
+                    || !after.is_none_or(|m| lp.step(m))
+                    || !lp.drain_deferred()
+                {
                     break;
                 }
             }
@@ -474,6 +483,9 @@ struct SendLoop {
     timing_conn: Option<crate::native::link::SessionLink>,
     probe_seq: bool,
     pick_us: u32,
+    stale_hold: Option<std::time::Duration>,
+    stale_since: Option<std::time::Instant>,
+    skipped: u32,
     pacer: crate::send_pacing::Pacer,
     /// The last frames' plaintext, for a client's NACK.
     ring: ResendRing,
@@ -491,6 +503,14 @@ struct SendLoop {
 /// Further-screen frames held behind one open streamed AU. A tail that never comes (an encode
 /// error, a rebuild of the first screen) must not grow this, or replay seconds of stale frames.
 const DEFERRED_MAX: usize = 8;
+
+fn stale_hold() -> Option<std::time::Duration> {
+    let ms = std::env::var("PUNKTFUNK_SEND_SKIP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
 
 /// Hold `f` until the open streamed AU closes, dropping the oldest past [`DEFERRED_MAX`]: a
 /// further screen is never resent, and its client asks a keyframe for what it lost. `true`
@@ -514,6 +534,54 @@ impl SendLoop {
             }
         }
         true
+    }
+
+    fn skip_stale(
+        &mut self,
+        msg: SendMsg,
+        rx: &std::sync::mpsc::Receiver<SendMsg>,
+    ) -> (SendMsg, Option<SendMsg>) {
+        let (Some(hold), SendMsg::Frame(f)) = (self.stale_hold, &msg) else {
+            return (msg, None);
+        };
+        let (_, _, hz) = unpack_mode(self.stats.mode.load(Ordering::Relaxed));
+        if f.meta.stream != 0 || hz == 0 || self.streamed.is_some() {
+            return (msg, None);
+        }
+        let age_ns = now_ns().saturating_sub(f.meta.capture_ns);
+        if age_ns <= 1_000_000_000 / u64::from(hz) {
+            self.stale_since = None;
+            return (msg, None);
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(*self.stale_since.get_or_insert(now)) < hold {
+            return (msg, None);
+        }
+        let (mut newest, mut after, mut dropped) = (msg, None, 0u32);
+        while let Ok(next) = rx.try_recv() {
+            match next {
+                SendMsg::Resend { frame, shards } => self.resend(frame, &shards),
+                SendMsg::Frame(n) if n.meta.stream == 0 && n.meta.flags & FLAG_SOF as u32 != 0 => {
+                    newest = SendMsg::Frame(n);
+                    dropped += 1;
+                }
+                other => {
+                    after = Some(other);
+                    break;
+                }
+            }
+        }
+        if dropped > 0 {
+            self.stale_since = None;
+            self.skipped = self.skipped.wrapping_add(dropped);
+            tracing::info!(
+                dropped,
+                total = self.skipped,
+                age_ms = age_ns / 1_000_000,
+                "send backlog: skipped to the newest frame"
+            );
+        }
+        (newest, after)
     }
 
     /// Between AUs: the probe burst's next filler, or a new burst the client asked for.
@@ -584,6 +652,10 @@ impl SendLoop {
                     );
                 }
                 return true;
+            }
+            SendMsg::Frame(mut f) if f.meta.stream == 0 => {
+                f.meta.frame_index = f.meta.frame_index.wrapping_sub(self.skipped);
+                SendMsg::Frame(f)
             }
             other => other,
         };
