@@ -9,6 +9,10 @@ authors.workspace = true
 repository.workspace = true
 links = "pyrowave"
 
+[features]
+# FP16 arithmetic in the wavelet kernels (PYROWAVE_FP32_MATH=OFF), for subgroup-8 GPUs.
+fp16-math = []
+
 [build-dependencies]
 # Same CMake-from-vendored-source model as opus/opusic-sys: reproducible
 # offline builds (CI, MSVC, flatpak — the flatpak builder has no network).

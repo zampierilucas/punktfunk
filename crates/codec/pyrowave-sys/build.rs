@@ -59,6 +59,11 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_FEATURE").is_ok_and(|f| f.split(',').any(|t| t == "crt-static")) {
         cfg.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded");
     }
+    // `fp16-math`: FP16 arithmetic (PYROWAVE_FP32_MATH=OFF). The subgroup-8 shuffle iDWT
+    // only runs at that precision; Mali-class clients opt in.
+    if env::var_os("CARGO_FEATURE_FP16_MATH").is_some() {
+        cfg.define("PYROWAVE_FP32_MATH", "OFF");
+    }
     let dst = cfg.build();
     let build = dst.join("build");
 
