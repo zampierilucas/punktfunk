@@ -1,0 +1,1040 @@
+Hybrid CPU dequant for large frames — PUNKTFUNK LOCAL PATCH.
+
+Not upstream.
+
+WHY. With 0014 the G52 still needs 20-24 ms of GPU time per 4K frame at 300 Mbps (live: about
+50 fps), over the 16.7 ms a 60 fps stream allows. Every further shader change got close but not
+under, because the iDWT alone is at the GPU's memory bandwidth.
+
+WHAT IT DOES. Adds cpudq.hpp: the dequant (bitplane unpacking into wavelet coefficients) runs on
+the CPU with NEON FP16 across several threads, writing linear write-combined images the GPU reads
+directly, and the GPU only runs the iDWT, one frame behind. Enabled by PYROWAVE_CPU_DEQUANT=1
+(PYROWAVE_CPU_DEQUANT_NICE sets the threads' priority); the webOS client sets it above 1080p.
+Granite gains map/unmap for image memory and lets linear array images skip device-local memory.
+On an LG C5, 4K60 at 300 Mbps holds 60 fps with about 17 ms of GPU time.
+
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.cpp b/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.cpp
+index 11aeadbde7570e82b50d287480119b9126e49d77..91a2187b1f110768ee31d8fa540a052ca4f8ec3e 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.cpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.cpp
+@@ -307,6 +307,16 @@ LinearHostImageHandle Device::create_linear_host_image(const LinearHostImageCrea
+ 	return LinearHostImageHandle(handle_pool.linear_images.allocate(this, std::move(gpu_image), std::move(cpu_image), info.stages));
+ }
+ 
++void *Device::map_image_memory(const Image &image, MemoryAccessFlags access)
++{
++	return managers.memory.map_memory(image.get_allocation(), access, 0, image.get_allocation().get_size());
++}
++
++void Device::unmap_image_memory(const Image &image, MemoryAccessFlags access)
++{
++	managers.memory.unmap_memory(image.get_allocation(), access, 0, image.get_allocation().get_size());
++}
++
+ void *Device::map_linear_host_image(const LinearHostImage &image, MemoryAccessFlags access)
+ {
+ 	void *host = managers.memory.map_memory(image.get_host_visible_allocation(), access,
+@@ -4226,7 +4236,7 @@ ImageHandle Device::create_image_from_staging_buffer(const ImageCreateInfo &crea
+ 		// Do some more stringent checks.
+ 		if (info.mipLevels > 1)
+ 			return ImageHandle(nullptr);
+-		if (info.arrayLayers > 1)
++		if (info.arrayLayers > 1 && (create_info.misc & IMAGE_MISC_LINEAR_IMAGE_IGNORE_DEVICE_LOCAL_BIT) == 0)
+ 			return ImageHandle(nullptr);
+ 		if (info.imageType != VK_IMAGE_TYPE_2D)
+ 			return ImageHandle(nullptr);
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.hpp b/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.hpp
+index 3b856be647439f30345889b8bcdc1104a2478b4b..2e43fa7bab6764e950a3c91d215bfce81289e258 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.hpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/Granite/vulkan/device.hpp
+@@ -357,6 +357,8 @@ public:
+ 	void *map_host_buffer(const Buffer &buffer, MemoryAccessFlags access, VkDeviceSize offset, VkDeviceSize length);
+ 	void unmap_host_buffer(const Buffer &buffer, MemoryAccessFlags access, VkDeviceSize offset, VkDeviceSize length);
+ 
++	void *map_image_memory(const Image &image, MemoryAccessFlags access);
++	void unmap_image_memory(const Image &image, MemoryAccessFlags access);
+ 	void *map_linear_host_image(const LinearHostImage &image, MemoryAccessFlags access);
+ 	void unmap_linear_host_image_and_sync(const LinearHostImage &image, MemoryAccessFlags access);
+ 
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp b/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4b25da4f6ffed6b13749bc8eee7aeaa3d84b974
+--- /dev/null
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp
+@@ -0,0 +1,652 @@
++// CPU port of wavelet_dequant.comp: bitstream -> R16F coefficient planes.
++#pragma once
++#include <stdint.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <math.h>
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#include <vector>
++#if defined(__linux__)
++#include <sys/resource.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++#include <algorithm>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
++namespace cpudq
++{
++static const int Levels = 5, Comps = 3;
++
++struct Plane
++{
++	int comp = 0, level = 0, band = 0;
++	int w = 0, h = 0;          // image size at this level
++	int stride = 0, rows = 0;  // padded to 32
++	size_t offset = 0;         // in halves
++	int bx32 = 0, by32 = 0;
++	int block0 = 0;            // first block index
++	uint16_t *ptr = nullptr;   // output base
++	int ostride = 0;           // output row stride in halves
++	bool clip = false;         // output exactly w x h (edge blocks go through a tile)
++};
++
++struct Dequant
++{
++	int W = 0, H = 0;
++	std::vector<Plane> planes;
++	std::vector<uint32_t> blk_plane; // block -> plane idx
++	int nblocks = 0;
++	size_t total_halves = 0;
++	uint16_t *base = nullptr;
++	std::vector<uint8_t> dirty;
++	std::vector<uint32_t> offs; // word offsets, UINT32_MAX = absent
++	bool use_neon = true;
++	bool wc = false; // write-combined destination: stage each block, then write full rows
++	bool use_runs = false;
++
++	void init(int width, int height)
++	{
++		W = width; H = height;
++		int aw = (W + 31) & ~31, ah = (H + 31) & ~31;
++		aw = aw < 128 ? 128 : aw; ah = ah < 128 ? 128 : ah;
++		int hw = aw / 2, hh = ah / 2;
++		size_t off = 0;
++		int blk = 0;
++		for (int level = Levels - 1; level >= 0; level--)
++			for (int c = 0; c < Comps; c++)
++			{
++				if (level == 0 && c != 0) continue;
++				for (int band = (level == Levels - 1 ? 0 : 1); band < 4; band++)
++				{
++					Plane p;
++					p.comp = c; p.level = level; p.band = band;
++					p.w = hw >> level; p.h = hh >> level;
++					p.stride = (p.w + 31) & ~31; p.rows = (p.h + 31) & ~31;
++					p.bx32 = p.stride / 32; p.by32 = p.rows / 32;
++					p.offset = off;
++					off += (size_t(p.stride) * p.rows + 31) & ~size_t(31);
++					p.block0 = blk;
++					blk += p.bx32 * p.by32;
++					planes.push_back(p);
++				}
++			}
++		nblocks = blk;
++		total_halves = off;
++		blk_plane.resize(nblocks);
++		for (size_t i = 0; i < planes.size(); i++)
++			for (int b = 0; b < planes[i].bx32 * planes[i].by32; b++)
++				blk_plane[planes[i].block0 + b] = uint32_t(i);
++		dirty.assign(nblocks, 1);
++		offs.assign(nblocks, UINT32_MAX);
++	}
++	size_t bytes() const { return total_halves * 2; }
++	void bind_contiguous(uint16_t *b)
++	{
++		base = b;
++		for (auto &p : planes) { p.ptr = b + p.offset; p.ostride = p.stride; p.clip = false; }
++	}
++
++	// returns false on malformed input
++	bool parse(const uint8_t *p, size_t size)
++	{
++		std::fill(offs.begin(), offs.end(), UINT32_MAX);
++		const uint8_t *start = p;
++		while (size >= 8)
++		{
++			uint32_t w0, w1;
++			memcpy(&w0, p, 4); memcpy(&w1, p + 4, 4);
++			if (w0 >> 31) { p += 8; size -= 8; continue; } // extended: 'extended' is bit 15 of the upper half
++			uint32_t pw = (w0 >> 16) & 0xfff;
++			if (pw < 2 || pw * 4 > size) return false;
++			uint32_t bi = w1 >> 8;
++			if (bi >= uint32_t(nblocks)) return false;
++			if (offs[bi] == UINT32_MAX) offs[bi] = uint32_t((p - start) / 4);
++			p += pw * 4; size -= pw * 4;
++		}
++		return size == 0;
++	}
++
++	static inline float decode_quant(uint32_t code)
++	{
++		int e = 4 - int(code >> 3);
++		int m = code & 7;
++		return (1.0f / (8.0f * 1024.0f * 1024.0f)) * (float(8 + m) * ldexpf(1.0f, 20 + e));
++	}
++
++	// scalar reference
++	static void block_scalar(const uint8_t *pay, uint32_t off_words, uint16_t *dst, int stride)
++	{
++		const uint8_t *b = pay + size_t(off_words) * 4;
++		uint32_t ballot = b[0] | (b[1] << 8);
++		uint32_t qcode = b[4];
++		int n = __builtin_popcount(ballot);
++		const uint8_t *cws = b + 8;
++		const uint8_t *cw2s = cws + 2 * n;
++		const uint8_t *pp = cws + 3 * n;
++		// total cost for sign start
++		uint32_t total = 0;
++		for (int i = 0; i < n; i++)
++		{
++			uint32_t c = cws[2 * i] | (cws[2 * i + 1] << 8);
++			uint32_t qb = cw2s[i] & 15;
++			for (int t = 0; t < 8; t++) total += qb + ((c >> (2 * t)) & 3);
++		}
++		uint64_t signpos = uint64_t(pp - pay + total) * 8;
++		float q = decode_quant(qcode);
++		int idx = 0;
++		for (int s = 0; s < 16; s++)
++		{
++			uint16_t *d = dst + (s >> 2) * 8 * stride + (s & 3) * 8;
++			if (!(ballot >> s & 1))
++			{
++				for (int y = 0; y < 8; y++) memset(d + y * stride, 0, 16);
++				continue;
++			}
++			uint32_t c = cws[2 * idx] | (cws[2 * idx + 1] << 8);
++			uint32_t qb = cw2s[idx] & 15;
++			float scale = float(cw2s[idx] >> 4) / 8.0f + 0.25f;
++			float inv = q * scale;
++			idx++;
++			for (int t = 0; t < 8; t++)
++			{
++				uint32_t f = (c >> (2 * t)) & 3;
++				int iters = int(qb + f);
++				uint32_t absv[8] = {};
++				for (int k = 0; k < iters; k++)
++				{
++					uint32_t byte = pp[k];
++					for (int bb = 0; bb < 8; bb++) absv[bb] |= ((byte >> bb) & 1u) << (iters - 1 - k);
++				}
++				pp += iters;
++				int x0 = 4 * (t >> 2), y0 = 2 * (t & 3);
++				if (c == 0) { for (int bb = 0; bb < 8; bb++) d[(y0 + (bb & 1)) * stride + x0 + (bb >> 1)] = 0; continue; }
++				for (int bb = 0; bb < 8; bb++)
++				{
++					float v = 0;
++					if (absv[bb])
++					{
++						v = (float(absv[bb]) + 0.5f) * inv;
++						uint32_t sb = (b_bit(pay, signpos++));
++						if (sb) v = -v;
++					}
++					d[(y0 + (bb & 1)) * stride + x0 + (bb >> 1)] = f2h(v);
++				}
++			}
++		}
++	}
++	static inline uint32_t b_bit(const uint8_t *p, uint64_t pos) { return (p[pos >> 3] >> (pos & 7)) & 1; }
++	static inline uint16_t f2h(float f)
++	{
++#if defined(__ARM_NEON)
++		return vget_lane_u16(vreinterpret_u16_f16(vcvt_f16_f32(vdupq_n_f32(f))), 0);
++#else
++		uint32_t x; memcpy(&x, &f, 4);
++		uint32_t s = (x >> 16) & 0x8000; int e = int((x >> 23) & 0xff) - 127 + 15; uint32_t m = x & 0x7fffff;
++		if (e <= 0) return uint16_t(s); // flush (reference only)
++		if (e >= 31) return uint16_t(s | 0x7c00);
++		uint32_t r = (uint32_t(e) << 10) | (m >> 13);
++		uint32_t rem = m & 0x1fff;
++		if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) r++;
++		return uint16_t(s | r);
++#endif
++	}
++
++#if defined(__ARM_NEON)
++
++	static inline uint8x16_t bit_transpose(uint8x16_t v)
++	{
++		uint64x2_t x = vreinterpretq_u64_u8(v), t;
++		t = vandq_u64(veorq_u64(x, vshlq_n_u64(x, 28)), vdupq_n_u64(0x0f0f0f0f00000000ULL));
++		x = veorq_u64(x, veorq_u64(t, vshrq_n_u64(t, 28)));
++		t = vandq_u64(veorq_u64(x, vshlq_n_u64(x, 14)), vdupq_n_u64(0x3333000033330000ULL));
++		x = veorq_u64(x, veorq_u64(t, vshrq_n_u64(t, 14)));
++		t = vandq_u64(veorq_u64(x, vshlq_n_u64(x, 7)), vdupq_n_u64(0x5500550055005500ULL));
++		x = veorq_u64(x, veorq_u64(t, vshrq_n_u64(t, 7)));
++		return vreinterpretq_u8_u64(x);
++	}
++	struct Tabs
++	{
++		uint8_t idx[256][8]; // sign-bit index for each set bit of the mask, 0xff elsewhere
++		uint8_t pc[256];
++		Tabs()
++		{
++			for (int m = 0; m < 256; m++)
++			{
++				int k = 0;
++				for (int b = 0; b < 8; b++)
++					idx[m][b] = (m >> b & 1) ? uint8_t(k++) : 0xff;
++				pc[m] = uint8_t(k);
++			}
++		}
++	};
++	static const Tabs &tabs() { static const Tabs t; return t; }
++
++	static inline uint16x8_t conv8(uint8x8_t mag, uint8x8_t neg, float inv2)
++	{
++		uint16x8_t v = vmovl_u8(mag);
++		uint16x8_t w = vandq_u16(vorrq_u16(vshlq_n_u16(v, 1), vdupq_n_u16(1)), vtstq_u16(v, v));
++		float32x4_t fl = vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(w))), inv2);
++		float32x4_t fh = vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(w))), inv2);
++		uint16x8_t h = vcombine_u16(vreinterpret_u16_f16(vcvt_f16_f32(fl)), vreinterpret_u16_f16(vcvt_f16_f32(fh)));
++		return veorq_u16(h, vshlq_n_u16(vmovl_u8(neg), 15));
++	}
++
++	// Branch-light sub-block decode, valid when every group has <= 8 bit-planes.
++	static inline void sub_fast(const uint8_t *pay, const uint8_t *&pp, uint64_t &signpos, uint32_t c, uint32_t qb,
++	                            float inv2, uint16_t *d, int stride, const Tabs &T)
++	{
++		static const uint8_t mt[16] = {0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255};
++		static const uint8_t bmv[8] = {1, 2, 4, 8, 16, 32, 64, 128};
++		const uint8x8_t bm8 = vld1_u8(bmv);
++		const uint8x16_t bm16 = vcombine_u8(bm8, bm8);
++		uint8x8_t xs[8];
++		const uint8_t *q = pp;
++		for (int t = 0; t < 8; t++)
++		{
++			uint32_t n = qb + ((c >> (2 * t)) & 3);
++			uint8x8_t x = vand_u8(vld1_u8(q + n - 8), vld1_u8(mt + n));
++			xs[t] = vrev64_u8(x);
++			q += n;
++		}
++		pp = q;
++		uint8x16_t Y[4];
++		uint32_t m[8];
++		for (int p = 0; p < 4; p++)
++		{
++			Y[p] = bit_transpose(vcombine_u8(xs[p], xs[p + 4]));
++			uint64x2_t s = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vandq_u8(vtstq_u8(Y[p], Y[p]), bm16))));
++			uint32x4_t s32 = vreinterpretq_u32_u64(s);
++			m[p] = vgetq_lane_u32(s32, 0);
++			m[p + 4] = vgetq_lane_u32(s32, 2);
++		}
++		uint8x8_t sel[8];
++		for (int t = 0; t < 8; t++)
++		{
++			uint32_t w32;
++			memcpy(&w32, pay + (signpos >> 3), 4);
++			uint32_t sbits = w32 >> (signpos & 7);
++			signpos += T.pc[m[t]];
++			sel[t] = vtbl1_u8(vtst_u8(vdup_n_u8(uint8_t(sbits)), bm8), vld1_u8(T.idx[m[t]]));
++		}
++		for (int p = 0; p < 4; p++)
++		{
++			uint8x8x2_t yu = vuzp_u8(vget_low_u8(Y[p]), vget_high_u8(Y[p]));
++			uint8x8x2_t su = vuzp_u8(sel[p], sel[p + 4]);
++			vst1q_u16(d + 2 * p * stride, conv8(yu.val[0], su.val[0], inv2));
++			vst1q_u16(d + (2 * p + 1) * stride, conv8(yu.val[1], su.val[1], inv2));
++		}
++	}
++
++	static void block_neon2(const uint8_t *pay, uint32_t off_words, uint16_t *dst, int stride)
++	{
++		const Tabs &T = tabs();
++		const uint8_t *b = pay + size_t(off_words) * 4;
++		uint32_t ballot = b[0] | (b[1] << 8);
++		uint32_t qcode = b[4];
++		int n = __builtin_popcount(ballot);
++		const uint8_t *cws = b + 8;
++		const uint8_t *cw2s = cws + 2 * n;
++		const uint8_t *pp = cws + 3 * n;
++		uint32_t total = 0;
++		for (int i = 0; i < n; i++)
++		{
++			uint32_t c = cws[2 * i] | (cws[2 * i + 1] << 8);
++			uint32_t qb = cw2s[i] & 15;
++			uint32_t s = (c & 0x3333) + ((c >> 2) & 0x3333);
++			s = (s & 0x0f0f) + ((s >> 4) & 0x0f0f);
++			s = (s & 0xff) + (s >> 8);
++			total += qb * 8 + s;
++		}
++		uint64_t signpos = uint64_t(pp - pay + total) * 8;
++		float q = decode_quant(qcode);
++		int idx = 0;
++		const uint16x8_t z = vdupq_n_u16(0);
++		for (int s = 0; s < 16; s++)
++		{
++			uint16_t *d = dst + (s >> 2) * 8 * stride + (s & 3) * 8;
++			if (!(ballot >> s & 1))
++			{
++				for (int y = 0; y < 8; y++) vst1q_u16(d + y * stride, z);
++				continue;
++			}
++			uint32_t c = cws[2 * idx] | (cws[2 * idx + 1] << 8);
++			uint32_t qb = cw2s[idx] & 15;
++			float inv = q * (float(cw2s[idx] >> 4) / 8.0f + 0.25f);
++			idx++;
++			if (c == 0)
++			{
++				pp += 8 * qb;
++				for (int y = 0; y < 8; y++) vst1q_u16(d + y * stride, z);
++				continue;
++			}
++			bool fast = qb <= 5;
++			if (!fast)
++			{
++				uint32_t mx = 0;
++				for (int t = 0; t < 8; t++) mx = std::max(mx, (c >> (2 * t)) & 3);
++				fast = qb + mx <= 8;
++			}
++			if (fast)
++			{
++				sub_fast(pay, pp, signpos, c, qb, inv * 0.5f, d, stride, T);
++				continue;
++			}
++			// slow path (rare): per-group bit-plane loop
++			static const uint8_t bitm[8] = {1, 2, 4, 8, 16, 32, 64, 128};
++			const uint8x8_t bm8 = vld1_u8(bitm);
++			const uint16x8_t bm16 = vmovl_u8(bm8);
++			for (int t = 0; t < 8; t++)
++			{
++				int iters = int(qb) + int((c >> (2 * t)) & 3);
++				uint16_t *o = d + 2 * (t & 3) * stride + 4 * (t >> 2);
++				if (iters == 0)
++				{
++					vst1_u16(o, vdup_n_u16(0));
++					vst1_u16(o + stride, vdup_n_u16(0));
++					continue;
++				}
++				uint32_t orv = 0;
++				uint32x4_t lo, hi;
++				if (iters <= 16)
++				{
++					int16x8_t acc = vdupq_n_s16(0);
++					for (int k = 0; k < iters; k++)
++					{
++						uint32_t by = pp[k];
++						orv |= by;
++						int16x8_t m = vreinterpretq_s16_s32(vdupq_n_s32(0)); (void)m;
++						uint8x8_t tm = vtst_u8(vdup_n_u8(uint8_t(by)), bm8);
++						int16x8_t mm = vmovl_s8(vreinterpret_s8_u8(tm));
++						acc = vsubq_s16(vaddq_s16(acc, acc), mm);
++					}
++					uint16x8_t ua = vreinterpretq_u16_s16(acc);
++					lo = vmovl_u16(vget_low_u16(ua));
++					hi = vmovl_u16(vget_high_u16(ua));
++				}
++				else
++				{
++					uint32x4_t al = vdupq_n_u32(0), ah = vdupq_n_u32(0);
++					for (int k = 0; k < iters; k++)
++					{
++						uint32_t by = pp[k];
++						orv |= by;
++						uint8x8_t tm = vtst_u8(vdup_n_u8(uint8_t(by)), bm8);
++						int16x8_t mm = vmovl_s8(vreinterpret_s8_u8(tm));
++						int32x4_t ml = vmovl_s16(vget_low_s16(mm)), mh = vmovl_s16(vget_high_s16(mm));
++						al = vreinterpretq_u32_s32(vsubq_s32(vreinterpretq_s32_u32(vaddq_u32(al, al)), ml));
++						ah = vreinterpretq_u32_s32(vsubq_s32(vreinterpretq_s32_u32(vaddq_u32(ah, ah)), mh));
++					}
++					lo = al; hi = ah;
++				}
++				pp += iters;
++				const uint32x4_t halfbits = vdupq_n_u32(0x3f000000);
++				float32x4_t fl = vcvtq_f32_u32(lo), fh = vcvtq_f32_u32(hi);
++				fl = vaddq_f32(fl, vreinterpretq_f32_u32(vandq_u32(vtstq_u32(lo, lo), halfbits)));
++				fh = vaddq_f32(fh, vreinterpretq_f32_u32(vandq_u32(vtstq_u32(hi, hi), halfbits)));
++				fl = vmulq_n_f32(fl, inv);
++				fh = vmulq_n_f32(fh, inv);
++				uint16x8_t h = vcombine_u16(vreinterpret_u16_f16(vcvt_f16_f32(fl)), vreinterpret_u16_f16(vcvt_f16_f32(fh)));
++				// signs
++				int k = __builtin_popcount(orv);
++				uint32_t sb = 0;
++				{
++					uint32_t w32;
++					memcpy(&w32, pay + (signpos >> 3), 4);
++					sb = (w32 >> (signpos & 7)) & ((1u << k) - 1);
++					signpos += k;
++				}
++				uint32_t neg = 0;
++				for (uint32_t m = orv; m; m &= m - 1)
++				{
++					neg |= (sb & 1u) << __builtin_ctz(m);
++					sb >>= 1;
++				}
++				if (neg)
++					h = veorq_u16(h, vandq_u16(vtstq_u16(vdupq_n_u16(uint16_t(neg)), bm16), vdupq_n_u16(0x8000)));
++				uint16x4x2_t u = vuzp_u16(vget_low_u16(h), vget_high_u16(h));
++				vst1_u16(o, u.val[0]);
++				vst1_u16(o + stride, u.val[1]);
++			}
++		}
++	}
++#endif
++
++	void do_block(int bi, const uint8_t *pay)
++	{
++		const Plane &pl = planes[blk_plane[bi]];
++		int lb = bi - pl.block0;
++		int bx = lb % pl.bx32, by = lb / pl.bx32;
++		int os = pl.ostride;
++		uint16_t *dst = pl.ptr + size_t(by) * 32 * os + bx * 32;
++		uint32_t o = offs[bi];
++		bool edge = pl.clip && ((bx + 1) * 32 > pl.w || (by + 1) * 32 > pl.h);
++		int vw = edge ? std::min(32, pl.w - bx * 32) : 32, vh = edge ? std::min(32, pl.h - by * 32) : 32;
++		if (o == UINT32_MAX)
++		{
++			if (dirty[bi])
++			{
++				for (int y = 0; y < vh; y++) memset(dst + size_t(y) * os, 0, vw * 2);
++				dirty[bi] = 0;
++			}
++			return;
++		}
++		dirty[bi] = 1;
++		alignas(16) uint16_t tile[32 * 32];
++		const bool stage = edge || wc;
++		uint16_t *d = stage ? tile : dst;
++		int ds = stage ? 32 : os;
++#if defined(__ARM_NEON)
++		if (use_neon) block_neon2(pay, o, d, ds); else
++#endif
++		block_scalar(pay, o, d, ds);
++		if (stage)
++		{
++#if defined(__ARM_NEON)
++			if (vw == 32)
++			{
++				for (int y = 0; y < vh; y++)
++				{
++					uint16_t *r = dst + size_t(y) * os;
++					const uint16_t *t = tile + y * 32;
++					vst1q_u16(r, vld1q_u16(t)); vst1q_u16(r + 8, vld1q_u16(t + 8));
++					vst1q_u16(r + 16, vld1q_u16(t + 16)); vst1q_u16(r + 24, vld1q_u16(t + 24));
++				}
++				return;
++			}
++#endif
++			for (int y = 0; y < vh; y++) memcpy(dst + size_t(y) * os, tile + y * 32, vw * 2);
++		}
++	}
++
++	static const int RunMax = 8;
++#if defined(__ARM_NEON)
++	void do_run(int bi, int n, const uint8_t *pay)
++	{
++		const Plane &pl = planes[blk_plane[bi]];
++		int lb = bi - pl.block0;
++		int bx = lb % pl.bx32, by = lb / pl.bx32;
++		int os = pl.ostride;
++		uint16_t *dst = pl.ptr + size_t(by) * 32 * os + bx * 32;
++		alignas(16) uint16_t tile[32 * 32 * RunMax];
++		const int ts = 32 * RunMax;
++		for (int i = 0; i < n; i++)
++		{
++			uint32_t o = offs[bi + i];
++			uint16_t *d = tile + i * 32;
++			if (o == UINT32_MAX)
++			{
++				dirty[bi + i] = 0;
++				uint16x8_t z = vdupq_n_u16(0);
++				for (int y = 0; y < 32; y++)
++				{
++					vst1q_u16(d + y * ts, z); vst1q_u16(d + y * ts + 8, z);
++					vst1q_u16(d + y * ts + 16, z); vst1q_u16(d + y * ts + 24, z);
++				}
++				continue;
++			}
++			dirty[bi + i] = 1;
++			block_neon2(pay, o, d, ts);
++		}
++		int vw = n * 32, vh = 32;
++		if (pl.clip)
++		{
++			vw = std::min(vw, pl.w - bx * 32);
++			vh = std::min(32, pl.h - by * 32);
++		}
++		size_t bytes = size_t(vw) * 2;
++		for (int y = 0; y < vh; y++)
++		{
++			const uint8_t *s = reinterpret_cast<const uint8_t *>(tile + y * ts);
++			uint8_t *t = reinterpret_cast<uint8_t *>(dst + size_t(y) * os);
++			memcpy(t, s, bytes);
++		}
++	}
++#else
++	void do_run(int, int, const uint8_t *) {}
++#endif
++
++	// Zero a horizontal run of dirty-absent blocks row by row so the stores stream.
++#if defined(__ARM_NEON)
++	void do_zero_run(int bi, int n)
++	{
++		const Plane &pl = planes[blk_plane[bi]];
++		int lb = bi - pl.block0;
++		int bx = lb % pl.bx32, by = lb / pl.bx32;
++		int os = pl.ostride;
++		int vw = n * 32, vh = 32;
++		if (pl.clip)
++		{
++			vw = std::min(vw, pl.w - bx * 32);
++			vh = std::min(32, pl.h - by * 32);
++		}
++		uint16_t *dst = pl.ptr + size_t(by) * 32 * os + bx * 32;
++		const uint16x8_t z = vdupq_n_u16(0);
++		for (int y = 0; y < vh; y++)
++		{
++			uint16_t *r = dst + size_t(y) * os;
++			int x = 0;
++			for (; x + 8 <= vw; x += 8) vst1q_u16(r + x, z);
++			for (; x < vw; x++) r[x] = 0;
++		}
++		for (int i = 0; i < n; i++) dirty[bi + i] = 0;
++	}
++#else
++	void do_zero_run(int, int) {}
++#endif
++
++	// persistent pool
++	struct Pool
++	{
++		std::vector<std::thread> th;
++		std::atomic<int> gen{0}, done{0}, next{0};
++		std::atomic<bool> quit{false};
++		std::vector<int> work;
++		Dequant *dq = nullptr;
++		const uint8_t *pay = nullptr;
++		std::mutex mu;
++		std::condition_variable cv;
++		void loop()
++		{
++#if defined(__linux__)
++			if (const char *n = getenv("PYROWAVE_CPU_DEQUANT_NICE"))
++				setpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)), atoi(n));
++#endif
++			int seen = 0;
++			for (;;)
++			{
++				for (int spins = 0; gen.load(std::memory_order_acquire) == seen; spins++)
++				{
++					if (quit.load())
++						return;
++					if (spins > 2000)
++					{
++						std::unique_lock<std::mutex> l(mu);
++						cv.wait(l, [&] { return gen.load() != seen || quit.load(); });
++						spins = 0;
++					}
++				}
++				seen = gen.load();
++				drain();
++				done.fetch_add(1, std::memory_order_acq_rel);
++			}
++		}
++		void drain()
++		{
++			for (;;)
++			{
++				int i = next.fetch_add(1, std::memory_order_relaxed);
++				if (i >= int(work.size())) break;
++				if (dq->use_runs) dq->do_run(work[i] & 0xffffff, work[i] >> 24, pay); else if (work[i] >> 24) dq->do_zero_run(work[i] & 0xffffff, work[i] >> 24); else dq->do_block(work[i], pay);
++			}
++		}
++		void start(Dequant *d, int extra)
++		{
++			dq = d;
++			for (int i = 0; i < extra; i++) th.emplace_back([this] { loop(); });
++		}
++		void stop()
++		{
++			quit = true;
++			{ std::lock_guard<std::mutex> l(mu); }
++			cv.notify_all();
++			for (auto &t : th) t.join();
++			th.clear();
++		}
++		void run(Dequant *d, const uint8_t *p)
++		{
++			dq = d; pay = p;
++			next = 0; done = 0;
++			gen.fetch_add(1, std::memory_order_release);
++			{ std::lock_guard<std::mutex> l(mu); }
++			cv.notify_all();
++			drain();
++			while (done.load(std::memory_order_acquire) < int(th.size())) {}
++		}
++	};
++	Pool pool;
++
++	// Build the work list (present blocks, largest first, plus dirty absent blocks) and decode.
++	void run(const uint8_t *pay)
++	{
++		pool.work.clear();
++		if (!use_runs)
++		{
++			int zs = -1, zn = 0;
++			for (int i = 0; i < nblocks; i++)
++			{
++				const bool present = offs[i] != UINT32_MAX;
++				const bool zero = !present && dirty[i];
++				if (zn)
++				{
++					const Plane &pl = planes[blk_plane[i]];
++					if (!zero || (i - pl.block0) % pl.bx32 == 0 || zn == 16) { pool.work.push_back(zs | (zn << 24)); zn = 0; }
++				}
++				if (zero) { if (!zn) zs = i; zn++; }
++				else if (present) pool.work.push_back(i);
++			}
++			if (zn) pool.work.push_back(zs | (zn << 24));
++		}
++		else
++		{
++			int start = -1, n = 0, nb = 1;
++			for (int i = 0; i < nblocks; i++)
++			{
++				const Plane &pl = planes[blk_plane[i]];
++				bool newrow = (i - pl.block0) % pl.bx32 == 0;
++				bool need = offs[i] != UINT32_MAX || dirty[i];
++				if (n && (!need || newrow || n == RunMax)) { pool.work.push_back(start | (n << 24)); n = 0; }
++				if (need) { if (!n) start = i; n++; }
++			}
++			if (n) pool.work.push_back(start | (n << 24));
++		}
++		pool.run(this, pay);
++	}
++};
++} // namespace cpudq
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
+index 1427d1b4df611ca6247d68ab63f576f31adccff7..d52c643a325d596f63cd631d3159981675a3b73f 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
+@@ -43,6 +43,7 @@ EXPORTS
+ 	pyrowave_decoder_set_payload_memory
+ 	pyrowave_decoder_push_packet_in_place
+ 	pyrowave_decoder_decode_is_ready
++	pyrowave_decoder_cpu_dequant_us
+ 	pyrowave_decoder_decode_is_ready_with_sideband
+ 	pyrowave_decoder_decode_gpu_buffer
+ 	pyrowave_decoder_decode_cpu_buffer_synchronous
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
+index d2fa2957f2ac148461565466f876c6268926f2fd..950aab5d859f82fd139835744194b622b3f5f6eb 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
+@@ -653,6 +653,10 @@ pyrowave_decoder_push_packet_in_place(pyrowave_decoder decoder, const void *data
+ PYROWAVE_PUBLIC_API bool
+ pyrowave_decoder_decode_is_ready(pyrowave_decoder decoder, bool allow_partial_frame);
+ 
++// Wall time of the last decode's CPU dequant in microseconds, 0 when PYROWAVE_CPU_DEQUANT is off.
++PYROWAVE_PUBLIC_API uint32_t
++pyrowave_decoder_cpu_dequant_us(pyrowave_decoder decoder);
++
+ PYROWAVE_PUBLIC_API bool
+ pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bool allow_partial_frame,
+ 		int num_pristine_bands, float minimum_packet_ratio,
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
+index 948901882b17fc59ff4743d118906d15af1417a7..57d442f8aa7789bc84a00ae4ab712fd6092bc3d5 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
+@@ -1715,6 +1715,11 @@ bool pyrowave_decoder_decode_is_ready(pyrowave_decoder decoder, bool allow_parti
+ 	return decoder->decoder.decode_is_ready(allow_partial_frame);
+ }
+ 
++uint32_t pyrowave_decoder_cpu_dequant_us(pyrowave_decoder decoder)
++{
++	return decoder->decoder.cpu_dequant_us();
++}
++
+ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bool allow_partial_frame,
+ 		int num_pristine_bands, float minimum_packet_ratio,
+ 		const uint32_t *active_block_mask, size_t word_count)
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
+index 7b7946ec004a926d9471addce1ca136e1a00a5d2..a2edec0ba9882be5f7f4840ed3802a2c87d6d924 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
+@@ -7,6 +7,12 @@
+ #include "math.hpp"
+ #include "pyrowave_common.hpp"
+ #include <algorithm>
++#include <chrono>
++#ifdef __linux__
++#include <sched.h>
++#endif
++#include <thread>
++#include "cpudq.hpp"
+ 
+ namespace PyroWave
+ {
+@@ -60,6 +66,27 @@ struct Decoder::Impl final : public WaveletBuffers
+ 	uint32_t last_seq = UINT32_MAX;
+ 	bool decoded_frame_for_current_sequence = false;
+ 
++	// PYROWAVE_CPU_DEQUANT=1: the CPU dequantizes into host-cached linear images (NEON, thread pool)
++	// and the GPU runs only the iDWT. Each ring slot has its own images and dirty map.
++	bool cpu_dq = getenv("PYROWAVE_CPU_DEQUANT") && atoi(getenv("PYROWAVE_CPU_DEQUANT")) != 0;
++	static constexpr int CpuRing = 4;
++	cpudq::Dequant hq;
++	bool cpu_dq_ready = false;
++	int cpu_slot = 0;
++	bool cpu_lin_fresh[CpuRing] = { true, true, true, true };
++	std::vector<uint8_t> cpu_dirty[CpuRing];
++	ImageHandle cpu_lin[CpuRing][NumComponents][DecompositionLevels];
++	ImageViewHandle cpu_lin_view[CpuRing][NumComponents][DecompositionLevels];
++	ImageViewHandle cpu_lin_ll[CpuRing][NumComponents][DecompositionLevels];
++	std::vector<uint32_t> cpu_offsets_scratch;
++	uint32_t cpu_dq_us = 0;
++	bool cpu_dq_setup();
++	bool cpu_dq_fill(CommandBuffer &cmd);
++	~Impl()
++	{
++		hq.pool.stop();
++	}
++
+ 	bool push_packet(const void *data, size_t size);
+ 	bool decode(CommandBuffer &cmd, const ViewBuffers &views);
+ 	bool decode_is_ready(bool allow_partial_frame) const;
+@@ -453,6 +480,122 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
+ 	return true;
+ }
+ 
++bool Decoder::Impl::cpu_dq_setup()
++{
++	if (chroma != ChromaSubsampling::Chroma420 || half_output || fragment_path || in_place_base)
++		return false;
++	hq.init(width, height);
++	// Write-combined (HOST_COHERENT, uncached) images need no cache flush; PYROWAVE_CPU_CACHED=1 restores the host-cached path.
++	const bool cached = getenv("PYROWAVE_CPU_CACHED") && atoi(getenv("PYROWAVE_CPU_CACHED")) != 0;
++	hq.wc = !cached;
++	for (auto &p : hq.planes)
++		if (p.w != int(wavelet_img_high_res->get_width(p.level)) || p.h != int(wavelet_img_high_res->get_height(p.level)))
++			return false;
++	for (int i = 0; i < CpuRing; i++)
++	{
++		for (int c = 0; c < NumComponents; c++)
++			for (int l = 0; l < DecompositionLevels; l++)
++			{
++				if (l == 0 && c != 0)
++					continue;
++				auto info = ImageCreateInfo::immutable_2d_image(wavelet_img_high_res->get_width(l),
++				                                                wavelet_img_high_res->get_height(l),
++				                                                VK_FORMAT_R16_SFLOAT);
++				info.domain = cached ? ImageDomain::LinearHostCached : ImageDomain::LinearHost;
++				info.layers = NumFrequencyBandsPerLevel;
++				info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
++				info.initial_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
++				info.misc |= IMAGE_MISC_LINEAR_IMAGE_IGNORE_DEVICE_LOCAL_BIT;
++				info.layout = ImageLayout::General;
++				cpu_lin[i][c][l] = device->create_image(info);
++				if (!cpu_lin[i][c][l])
++					return false;
++				ImageViewCreateInfo vi = {};
++				vi.image = cpu_lin[i][c][l].get();
++				vi.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++				vi.layers = NumFrequencyBandsPerLevel;
++				vi.levels = 1;
++				cpu_lin_view[i][c][l] = device->create_image_view(vi);
++				vi.view_type = VK_IMAGE_VIEW_TYPE_2D;
++				vi.layers = 1;
++				cpu_lin_ll[i][c][l] = device->create_image_view(vi);
++			}
++		cpu_dirty[i].assign(hq.nblocks, 1);
++		cpu_lin_fresh[i] = true;
++	}
++	// The calling thread is one worker; leave one core for the rest of the client.
++	long ncpu = long(std::thread::hardware_concurrency());
++#ifdef __linux__
++	cpu_set_t set;
++	if (sched_getaffinity(0, sizeof(set), &set) == 0)
++		ncpu = CPU_COUNT(&set);
++#endif
++	int threads = int(std::max(1L, std::min(3L, ncpu - 1)));
++	if (const char *t = getenv("PYROWAVE_CPU_DEQUANT_THREADS"))
++		threads = std::max(1, atoi(t));
++	hq.pool.start(&hq, threads - 1);
++	return true;
++}
++
++bool Decoder::Impl::cpu_dq_fill(CommandBuffer &cmd)
++{
++	const auto now_us = [] {
++		return std::chrono::duration_cast<std::chrono::microseconds>(
++				std::chrono::steady_clock::now().time_since_epoch()).count();
++	};
++	const auto t0 = now_us();
++	cpu_slot = (cpu_slot + 1) % CpuRing;
++	const int slot = cpu_slot;
++
++	// The NEON reader may read a few bytes past the last block.
++	const size_t payload_words = payload_data_cpu.size();
++	payload_data_cpu.resize(payload_words + 4, 0);
++	hq.offs = dequant_offset_buffer_cpu;
++	hq.dirty.swap(cpu_dirty[slot]);
++
++	uint8_t *bases[NumComponents][DecompositionLevels] = {};
++	for (int c = 0; c < NumComponents; c++)
++		for (int l = 0; l < DecompositionLevels; l++)
++			if (cpu_lin[slot][c][l])
++				bases[c][l] = static_cast<uint8_t *>(device->map_image_memory(*cpu_lin[slot][c][l], MEMORY_ACCESS_WRITE_BIT));
++	bool ok = true;
++	for (auto &p : hq.planes)
++	{
++		VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, uint32_t(p.band) };
++		VkSubresourceLayout lay;
++		device->get_device_table().vkGetImageSubresourceLayout(device->get_device(),
++		                                                       cpu_lin[slot][p.comp][p.level]->get_image(), &sub, &lay);
++		p.ptr = reinterpret_cast<uint16_t *>(bases[p.comp][p.level] + lay.offset);
++		p.ostride = int(lay.rowPitch / 2);
++		p.clip = true;
++		ok = ok && lay.rowPitch % 2 == 0;
++	}
++	if (ok)
++		hq.run(reinterpret_cast<const uint8_t *>(payload_data_cpu.data()));
++
++	for (int c = 0; c < NumComponents; c++)
++		for (int l = 0; l < DecompositionLevels; l++)
++			if (cpu_lin[slot][c][l])
++				device->unmap_image_memory(*cpu_lin[slot][c][l], MEMORY_ACCESS_WRITE_BIT);
++	hq.dirty.swap(cpu_dirty[slot]);
++	payload_data_cpu.resize(payload_words);
++	cpu_dq_us = uint32_t(now_us() - t0);
++	if (!ok)
++		return false;
++
++	for (int c = 0; c < NumComponents; c++)
++		for (int l = 0; l < DecompositionLevels; l++)
++			if (cpu_lin[slot][c][l])
++				cmd.image_barrier(*cpu_lin[slot][c][l],
++				                  cpu_lin_fresh[slot] ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_GENERAL,
++				                  VK_IMAGE_LAYOUT_GENERAL,
++				                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++				                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++				                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
++	cpu_lin_fresh[slot] = false;
++	return true;
++}
++
+ bool Decoder::Impl::idwt_fragment(CommandBuffer &cmd, const ViewBuffers &views)
+ {
+ 	const auto add_discard = [&](const Vulkan::Image *img) {
+@@ -1010,7 +1153,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
+ 					snprintf(label, sizeof(label), "iDWT final, component %u", c);
+ 					cmd.begin_region(label);
+ 					cmd.set_storage_texture(0, 1, *views.planes[c]);
+-					cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
++					cmd.set_texture(0, 0, cpu_dq ? *cpu_lin_view[cpu_slot][c][input_level] : *component_layer_views[c][input_level], *mirror_repeat_sampler);
+ 					select_program(c, input_level, true);
+ 					cmd.dispatch((push.resolution.x + 15) / 16, groups_y(push.resolution.y), 1);
+ 					cmd.end_region();
+@@ -1020,7 +1163,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
+ 			{
+ 				cmd.set_storage_texture(0, 1, *views.planes[0]);
+ 				cmd.begin_region("iDWT final");
+-				cmd.set_texture(0, 0, *component_layer_views[0][input_level], *mirror_repeat_sampler);
++				cmd.set_texture(0, 0, cpu_dq ? *cpu_lin_view[cpu_slot][0][input_level] : *component_layer_views[0][input_level], *mirror_repeat_sampler);
+ 				select_program(0, input_level, true);
+ 				cmd.dispatch((push.resolution.x + 15) / 16, groups_y(push.resolution.y), 1);
+ 				cmd.end_region();
+@@ -1034,7 +1177,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
+ 				if (input_level < final_level)
+ 					continue;
+ 
+-				cmd.set_texture(0, 0, *component_layer_views[c][input_level], *mirror_repeat_sampler);
++				cmd.set_texture(0, 0, cpu_dq ? *cpu_lin_view[cpu_slot][c][input_level] : *component_layer_views[c][input_level], *mirror_repeat_sampler);
+ 
+ 				if (input_level == final_level)
+ 				{
+@@ -1046,7 +1189,7 @@ bool Decoder::Impl::idwt(CommandBuffer &cmd, const ViewBuffers &views)
+ 				}
+ 				else
+ 				{
+-					cmd.set_storage_texture(0, 1, *component_ll_views[c][input_level - 1]);
++					cmd.set_storage_texture(0, 1, cpu_dq ? *cpu_lin_ll[cpu_slot][c][input_level - 1] : *component_ll_views[c][input_level - 1]);
+ 					cmd.set_specialization_constant(0, false);
+ 				}
+ 
+@@ -1158,16 +1301,33 @@ bool Decoder::Impl::decode_is_ready(bool allow_partial_frame) const
+ 
+ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
+ {
++	if (cpu_dq && !cpu_dq_ready)
++	{
++		cpu_dq_ready = cpu_dq_setup();
++		if (!cpu_dq_ready)
++		{
++			LOGE("CPU dequant unavailable, using the GPU path.\n");
++			cpu_dq = false;
++		}
++	}
++
+ 	cmd.begin_region("Decode uploads");
+ 	{
+-		if (!upload_payload(cmd))
++		if (!cpu_dq && !upload_payload(cmd))
+ 		{
+ 			cmd.end_region();
+ 			return false;
+ 		}
+ 
+-		auto *offsets = static_cast<uint32_t *>(cmd.update_buffer(*dequant_offset_buffer, 0,
+-		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())));
++		uint32_t *offsets;
++		if (cpu_dq)
++		{
++			cpu_offsets_scratch.resize(dequant_offset_buffer_cpu.size());
++			offsets = cpu_offsets_scratch.data();
++		}
++		else
++			offsets = static_cast<uint32_t *>(cmd.update_buffer(*dequant_offset_buffer, 0,
++			                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())));
+ 		const bool skip_bands = skip_bands_enabled && !fragment_path && use_idwt_shuf();
+ 		for (int c = 0; c < NumComponents; c++)
+ 		{
+@@ -1233,7 +1393,12 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
+ 	if (stages < 1)
+ 		return true;
+ 
+-	if (!dequant(cmd))
++	if (cpu_dq)
++	{
++		if (!cpu_dq_fill(cmd))
++			return false;
++	}
++	else if (!dequant(cmd))
+ 		return false;
+ 
+ 	if (stages < 2)
+@@ -1525,6 +1690,11 @@ bool Decoder::decode(Vulkan::CommandBuffer &cmd, const ViewBuffers &views)
+ 	return impl->decode(cmd, views);
+ }
+ 
++uint32_t Decoder::cpu_dequant_us() const
++{
++	return impl->cpu_dq_us;
++}
++
+ bool Decoder::decode_is_ready(bool allow_partial_frame) const
+ {
+ 	return impl->decode_is_ready(allow_partial_frame);
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
+index 0c34e8411a6e51958c9671c8eada36b7283dc47e..843449d717cf0d8599d9eb791fb941f26a6467fd 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
+@@ -50,6 +50,9 @@ public:
+ 
+ 	bool decode_is_ready(bool allow_partial_frame) const;
+ 
++	// Wall time of the last frame's CPU dequant (PYROWAVE_CPU_DEQUANT=1), 0 otherwise.
++	uint32_t cpu_dequant_us() const;
++
+ 	// A more refined version of decode_is_ready() that allows a bit more control.
+ 	// The default is num_pristine_bands = 2 (the next-to-final LL band) and minimum_packet_ratio = 0.9.
+ 	// active_block_mask is an optional pointer.

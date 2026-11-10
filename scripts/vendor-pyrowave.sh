@@ -149,6 +149,14 @@ number is never reused.
   0012-decoder-cached-plane-views.patch — the decoder keeps the plane views of
     the four output sets a client rotates through, so the fragment path's
     framebuffers come from Granite's cache instead of being made every frame.
+  0014-mali-subgroup8-decode.patch — the dequant shader assumed a subgroup of
+    at least 16 and decoded wrong coefficients on Mali's 8; adds a shuffle iDWT
+    for that size. Sent upstream as Themaister/pyrowave #35.
+  0015-hybrid-cpu-dequant.patch — dequantizes part of each frame on the CPU
+    (cpudq.hpp, NEON) while the GPU does the rest, for clients whose GPU cannot
+    decode 4K60 alone (LG webOS Mali).
+  0016-early-dequant.patch — runs that CPU dequant per packet as it arrives, so
+    only the GPU passes remain after the last packet. Inert unless called.
 
 Retired (upstream carries the fix):
   0006 external-memory consume-on-success-only — Granite b6cffd5c (2026-09-23)

@@ -1,0 +1,402 @@
+Dequantize blocks while the frame is still arriving — PUNKTFUNK LOCAL PATCH.
+
+Not upstream. Builds on 0015.
+
+WHY. With the CPU dequant, its 2-3 ms still started only after the last packet of a frame.
+
+WHAT IT DOES. Adds an entry point that dequantizes the blocks of one packet as soon as it lands
+(the host already packs whole blocks per packet), so only the GPU passes remain after the last
+packet. A lost packet leaves its blocks to the normal full-frame dequant, so loss behaves as
+before, and the output is identical to a full-frame decode. Inert unless the caller uses it.
+On an LG C5 at 4K60: last packet to decoded 23.2 -> 21.0 ms.
+
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp b/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp
+index d4b25da4f6ffed6b13749bc8eee7aeaa3d84b974..28c9be0cd263a53bb4060c37a8c24d40263bd46b 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/cpudq.hpp
+@@ -47,6 +47,7 @@ struct Dequant
+ 	uint16_t *base = nullptr;
+ 	std::vector<uint8_t> dirty;
+ 	std::vector<uint32_t> offs; // word offsets, UINT32_MAX = absent
++	std::vector<uint8_t> skip;  // non-empty: present blocks with skip[i] set are already done
+ 	bool use_neon = true;
+ 	bool wc = false; // write-combined destination: stage each block, then write full rows
+ 	bool use_runs = false;
+@@ -621,8 +622,9 @@ struct Dequant
+ 			int zs = -1, zn = 0;
+ 			for (int i = 0; i < nblocks; i++)
+ 			{
+-				const bool present = offs[i] != UINT32_MAX;
+-				const bool zero = !present && dirty[i];
++				const bool absent = offs[i] == UINT32_MAX;
++				const bool present = !absent && (skip.empty() || !skip[i]);
++				const bool zero = absent && dirty[i];
+ 				if (zn)
+ 				{
+ 					const Plane &pl = planes[blk_plane[i]];
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
+index 70699a6ee647c648b8a760a97f12ff53a3da5efc..b7e429501077de405e8481a10658b678125427fe 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave-shared.def
+@@ -46,6 +46,9 @@ EXPORTS
+ 	pyrowave_decoder_push_packet_in_place
+ 	pyrowave_decoder_decode_is_ready
+ 	pyrowave_decoder_cpu_dequant_us
++	pyrowave_decoder_early_windows
++	pyrowave_decoder_early_claim
++	pyrowave_decoder_early_verify_result
+ 	pyrowave_decoder_decode_is_ready_with_sideband
+ 	pyrowave_decoder_decode_gpu_buffer
+ 	pyrowave_decoder_decode_cpu_buffer_synchronous
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
+index 200723482d62aa9f87ce01e5e280fea451591b93..814af4ea52203892942db805b4615ea225dce339 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave.h
+@@ -669,6 +669,20 @@ pyrowave_decoder_decode_is_ready(pyrowave_decoder decoder, bool allow_partial_fr
+ PYROWAVE_PUBLIC_API uint32_t
+ pyrowave_decoder_cpu_dequant_us(pyrowave_decoder decoder);
+ 
++// Early CPU dequant of frame `tag` while it arrives: `count` datagram-aligned windows of
++// `window_bytes`. Returns the blocks dequantized. No-op without PYROWAVE_CPU_DEQUANT.
++PYROWAVE_PUBLIC_API uint32_t
++pyrowave_decoder_early_windows(pyrowave_decoder decoder, uint32_t tag, const void *windows, size_t count,
++                               size_t window_bytes);
++
++// Call before decoding frame `tag`: reuses its early work (returns its block count) or drops it.
++PYROWAVE_PUBLIC_API uint32_t
++pyrowave_decoder_early_claim(pyrowave_decoder decoder, uint32_t tag);
++
++// PYROWAVE_EARLY_VERIFY=N: mismatching coefficients of the last check, -1 before any.
++PYROWAVE_PUBLIC_API int
++pyrowave_decoder_early_verify_result(pyrowave_decoder decoder);
++
+ PYROWAVE_PUBLIC_API bool
+ pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bool allow_partial_frame,
+ 		int num_pristine_bands, float minimum_packet_ratio,
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
+index db7ea902bb23045306295643148c6fe576138af5..824b013336624647d953d8ecb826333c830bd856 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_c.cpp
+@@ -1757,6 +1757,22 @@ uint32_t pyrowave_decoder_cpu_dequant_us(pyrowave_decoder decoder)
+ 	return decoder->decoder.cpu_dequant_us();
+ }
+ 
++uint32_t pyrowave_decoder_early_windows(pyrowave_decoder decoder, uint32_t tag, const void *windows, size_t count,
++                                        size_t window_bytes)
++{
++	return decoder->decoder.early_windows(tag, windows, count, window_bytes);
++}
++
++uint32_t pyrowave_decoder_early_claim(pyrowave_decoder decoder, uint32_t tag)
++{
++	return decoder->decoder.early_claim(tag);
++}
++
++int pyrowave_decoder_early_verify_result(pyrowave_decoder decoder)
++{
++	return decoder->decoder.early_verify_result();
++}
++
+ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bool allow_partial_frame,
+ 		int num_pristine_bands, float minimum_packet_ratio,
+ 		const uint32_t *active_block_mask, size_t word_count)
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
+index a2edec0ba9882be5f7f4840ed3802a2c87d6d924..06bda00df3171799878f2cbf13b284bdb9451fe8 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.cpp
+@@ -82,6 +82,23 @@ struct Decoder::Impl final : public WaveletBuffers
+ 	uint32_t cpu_dq_us = 0;
+ 	bool cpu_dq_setup();
+ 	bool cpu_dq_fill(CommandBuffer &cmd);
++	bool cpu_dq_into(int slot, const uint8_t *pay, bool listed);
++	int cpu_free_slot(int avoid) const;
++	// Early dequant: windows of frame `early_tag` dequantized into `early_slot` while it arrives.
++	int gpu_slot[2] = { -1, -1 };
++	int early_slot = -1;
++	uint32_t early_tag = 0, claimed_tag = 0;
++	bool early_use = false, any_claimed = false;
++	std::vector<uint8_t> early_done;
++	std::vector<uint32_t> early_offs, early_pay;
++	std::vector<std::pair<uint16_t *, int>> early_ptrs; // per plane, the early slot's mapping
++	uint32_t early_done_blocks = 0;
++	int early_verify = getenv("PYROWAVE_EARLY_VERIFY") ? atoi(getenv("PYROWAVE_EARLY_VERIFY")) : 0;
++	int early_verify_n = 0;
++	int early_verify_bad = -1;
++	uint32_t early_windows(uint32_t tag, const uint8_t *wins, size_t count, size_t wbytes);
++	uint32_t early_claim(uint32_t tag);
++	void early_check(int slot);
+ 	~Impl()
+ 	{
+ 		hq.pool.stop();
+@@ -537,22 +554,21 @@ bool Decoder::Impl::cpu_dq_setup()
+ 	return true;
+ }
+ 
+-bool Decoder::Impl::cpu_dq_fill(CommandBuffer &cmd)
++int Decoder::Impl::cpu_free_slot(int avoid) const
+ {
+-	const auto now_us = [] {
+-		return std::chrono::duration_cast<std::chrono::microseconds>(
+-				std::chrono::steady_clock::now().time_since_epoch()).count();
+-	};
+-	const auto t0 = now_us();
+-	cpu_slot = (cpu_slot + 1) % CpuRing;
+-	const int slot = cpu_slot;
++	for (int k = 1; k <= CpuRing; k++)
++	{
++		int s = (cpu_slot + k) % CpuRing;
++		if (s != gpu_slot[0] && s != gpu_slot[1] && s != avoid)
++			return s;
++	}
++	return (cpu_slot + 1) % CpuRing;
++}
+ 
+-	// The NEON reader may read a few bytes past the last block.
+-	const size_t payload_words = payload_data_cpu.size();
+-	payload_data_cpu.resize(payload_words + 4, 0);
+-	hq.offs = dequant_offset_buffer_cpu;
++// Dequantize into ring slot `slot`: hq.pool.work as built (listed), else every block hq.run picks.
++bool Decoder::Impl::cpu_dq_into(int slot, const uint8_t *pay, bool listed)
++{
+ 	hq.dirty.swap(cpu_dirty[slot]);
+-
+ 	uint8_t *bases[NumComponents][DecompositionLevels] = {};
+ 	for (int c = 0; c < NumComponents; c++)
+ 		for (int l = 0; l < DecompositionLevels; l++)
+@@ -571,17 +587,191 @@ bool Decoder::Impl::cpu_dq_fill(CommandBuffer &cmd)
+ 		ok = ok && lay.rowPitch % 2 == 0;
+ 	}
+ 	if (ok)
+-		hq.run(reinterpret_cast<const uint8_t *>(payload_data_cpu.data()));
+-
++	{
++		if (listed)
++			hq.pool.run(&hq, pay);
++		else
++			hq.run(pay);
++	}
+ 	for (int c = 0; c < NumComponents; c++)
+ 		for (int l = 0; l < DecompositionLevels; l++)
+ 			if (cpu_lin[slot][c][l])
+ 				device->unmap_image_memory(*cpu_lin[slot][c][l], MEMORY_ACCESS_WRITE_BIT);
+ 	hq.dirty.swap(cpu_dirty[slot]);
+-	payload_data_cpu.resize(payload_words);
++	return ok;
++}
++
++uint32_t Decoder::Impl::early_windows(uint32_t tag, const uint8_t *wins, size_t count, size_t wbytes)
++{
++	if (!cpu_dq_ready || hq.use_runs || !hq.wc || wbytes < 8)
++		return 0;
++	// Already decoded, or older than the frame in progress.
++	if (any_claimed && int32_t(tag - claimed_tag) <= 0)
++		return 0;
++	if (early_slot >= 0 && tag != early_tag)
++	{
++		if (int32_t(tag - early_tag) < 0)
++			return 0;
++		early_slot = -1; // abandoned: the slot's dirty map still describes what it holds
++	}
++	if (early_slot < 0)
++	{
++		early_slot = cpu_free_slot(-1);
++		early_tag = tag;
++		early_done.assign(hq.nblocks, 0);
++		early_offs.assign(hq.nblocks, UINT32_MAX);
++		early_pay.clear();
++		early_done_blocks = 0;
++		// Coherent memory (hq.wc): mapped once for the frame, no flush owed.
++		early_ptrs.clear();
++		for (auto &p : hq.planes)
++		{
++			auto *base = static_cast<uint8_t *>(device->map_image_memory(*cpu_lin[early_slot][p.comp][p.level], MEMORY_ACCESS_WRITE_BIT));
++			VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, uint32_t(p.band) };
++			VkSubresourceLayout lay;
++			device->get_device_table().vkGetImageSubresourceLayout(device->get_device(),
++			                                                       cpu_lin[early_slot][p.comp][p.level]->get_image(), &sub, &lay);
++			if (lay.rowPitch % 2 != 0)
++			{
++				early_slot = -1;
++				return 0;
++			}
++			early_ptrs.emplace_back(reinterpret_cast<uint16_t *>(base + lay.offset), int(lay.rowPitch / 2));
++		}
++	}
++	auto &work = hq.pool.work;
++	work.clear();
++	for (size_t w = 0; w < count; w++)
++	{
++		const uint8_t *win = wins + w * wbytes;
++		uint16_t used, kind;
++		memcpy(&used, win, 2);
++		memcpy(&kind, win + 2, 2);
++		if (kind != 0 || used == 0 || size_t(used) + 4 > wbytes)
++			continue;
++		const uint8_t *p = win + 4;
++		size_t size = used;
++		while (size >= 8)
++		{
++			uint32_t w0, w1;
++			memcpy(&w0, p, 4);
++			memcpy(&w1, p + 4, 4);
++			if (w0 >> 31)
++			{
++				p += 8;
++				size -= 8;
++				continue;
++			}
++			uint32_t pw = (w0 >> 16) & 0xfff;
++			uint32_t bi = w1 >> 8;
++			if (pw < 2 || pw * 4 > size || bi >= uint32_t(hq.nblocks))
++				break;
++			if (!early_done[bi])
++			{
++				early_done[bi] = 1;
++				early_offs[bi] = uint32_t(early_pay.size());
++				size_t at = early_pay.size();
++				early_pay.resize(at + pw);
++				memcpy(early_pay.data() + at, p, pw * 4);
++				work.push_back(int(bi));
++			}
++			p += pw * 4;
++			size -= pw * 4;
++		}
++	}
++	if (work.empty())
++		return 0;
++	// The NEON reader may read a few bytes past the last block.
++	const size_t words = early_pay.size();
++	early_pay.resize(words + 4, 0);
++	for (size_t i = 0; i < hq.planes.size(); i++)
++	{
++		hq.planes[i].ptr = early_ptrs[i].first;
++		hq.planes[i].ostride = early_ptrs[i].second;
++		hq.planes[i].clip = true;
++	}
++	hq.offs.swap(early_offs);
++	hq.dirty.swap(cpu_dirty[early_slot]);
++	hq.pool.run(&hq, reinterpret_cast<const uint8_t *>(early_pay.data()));
++	hq.dirty.swap(cpu_dirty[early_slot]);
++	hq.offs.swap(early_offs);
++	early_pay.resize(words);
++	early_done_blocks += uint32_t(work.size());
++	return uint32_t(work.size());
++}
++
++uint32_t Decoder::Impl::early_claim(uint32_t tag)
++{
++	any_claimed = true;
++	claimed_tag = tag;
++	early_use = early_slot >= 0 && early_tag == tag;
++	if (early_slot >= 0 && int32_t(early_tag - tag) < 0)
++		early_slot = -1;
++	return early_use ? early_done_blocks : 0;
++}
++
++// PYROWAVE_EARLY_VERIFY=N: every Nth early frame, dequantize the whole AU again on one thread into
++// a heap buffer and compare it with the slot. early_verify_bad = mismatching halves of the last check.
++void Decoder::Impl::early_check(int slot)
++{
++	cpudq::Dequant ref;
++	ref.init(width, height);
++	ref.wc = false;
++	std::vector<uint16_t> buf(ref.total_halves + 64);
++	ref.bind_contiguous(buf.data());
++	ref.offs = dequant_offset_buffer_cpu;
++	ref.run(reinterpret_cast<const uint8_t *>(payload_data_cpu.data()));
++	int bad = 0;
++	for (size_t i = 0; i < hq.planes.size(); i++)
++	{
++		auto &p = hq.planes[i];
++		auto &r = ref.planes[i];
++		auto *base = static_cast<uint8_t *>(device->map_image_memory(*cpu_lin[slot][p.comp][p.level], MEMORY_ACCESS_READ_BIT));
++		VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, uint32_t(p.band) };
++		VkSubresourceLayout lay;
++		device->get_device_table().vkGetImageSubresourceLayout(device->get_device(),
++		                                                       cpu_lin[slot][p.comp][p.level]->get_image(), &sub, &lay);
++		auto *img = reinterpret_cast<const uint16_t *>(base + lay.offset);
++		for (int y = 0; y < p.h; y++)
++			for (int x = 0; x < p.w; x++)
++				bad += img[size_t(y) * (lay.rowPitch / 2) + x] != r.ptr[size_t(y) * r.ostride + x];
++		device->unmap_image_memory(*cpu_lin[slot][p.comp][p.level], MEMORY_ACCESS_READ_BIT);
++	}
++	early_verify_bad = bad;
++	LOGI("early dequant verify: %d mismatching coefficients\n", bad);
++}
++
++bool Decoder::Impl::cpu_dq_fill(CommandBuffer &cmd)
++{
++	const auto now_us = [] {
++		return std::chrono::duration_cast<std::chrono::microseconds>(
++				std::chrono::steady_clock::now().time_since_epoch()).count();
++	};
++	const auto t0 = now_us();
++	const bool early = early_use && early_slot >= 0;
++	early_use = false;
++	const int slot = early ? early_slot : cpu_free_slot(early_slot);
++	if (early)
++		early_slot = -1;
++
++	// The NEON reader may read a few bytes past the last block.
++	const size_t payload_words = payload_data_cpu.size();
++	payload_data_cpu.resize(payload_words + 4, 0);
++	hq.offs = dequant_offset_buffer_cpu;
++	if (early)
++		hq.skip.swap(early_done);
++	bool ok = cpu_dq_into(slot, reinterpret_cast<const uint8_t *>(payload_data_cpu.data()), false);
++	if (early)
++		hq.skip.swap(early_done);
+ 	cpu_dq_us = uint32_t(now_us() - t0);
++	if (ok && early && early_verify > 0 && ++early_verify_n % early_verify == 0)
++		early_check(slot);
++	payload_data_cpu.resize(payload_words);
+ 	if (!ok)
+ 		return false;
++	cpu_slot = slot;
++	gpu_slot[1] = gpu_slot[0];
++	gpu_slot[0] = slot;
+ 
+ 	for (int c = 0; c < NumComponents; c++)
+ 		for (int l = 0; l < DecompositionLevels; l++)
+@@ -1695,6 +1885,21 @@ uint32_t Decoder::cpu_dequant_us() const
+ 	return impl->cpu_dq_us;
+ }
+ 
++uint32_t Decoder::early_windows(uint32_t tag, const void *windows, size_t count, size_t window_bytes)
++{
++	return impl->early_windows(tag, static_cast<const uint8_t *>(windows), count, window_bytes);
++}
++
++uint32_t Decoder::early_claim(uint32_t tag)
++{
++	return impl->early_claim(tag);
++}
++
++int Decoder::early_verify_result() const
++{
++	return impl->early_verify_bad;
++}
++
+ bool Decoder::decode_is_ready(bool allow_partial_frame) const
+ {
+ 	return impl->decode_is_ready(allow_partial_frame);
+diff --git a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
+index 843449d717cf0d8599d9eb791fb941f26a6467fd..6738af484ad6c9d425fd81296f532d9a53f1ce85 100644
+--- a/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
++++ b/crates/codec/pyrowave-sys/vendor/pyrowave/pyrowave_decoder.hpp
+@@ -53,6 +53,15 @@ public:
+ 	// Wall time of the last frame's CPU dequant (PYROWAVE_CPU_DEQUANT=1), 0 otherwise.
+ 	uint32_t cpu_dequant_us() const;
+ 
++	// Early CPU dequant (PYROWAVE_CPU_DEQUANT=1): `count` datagram-aligned windows of
++	// `window_bytes` from frame `tag`, dequantized now; returns the blocks done. FRAG windows
++	// are left for decode. A newer tag abandons the older frame's work.
++	uint32_t early_windows(uint32_t tag, const void *windows, size_t count, size_t window_bytes);
++	// The next decode is frame `tag`: reuse its early work (returns its block count) or drop it.
++	uint32_t early_claim(uint32_t tag);
++	// PYROWAVE_EARLY_VERIFY: mismatching coefficients of the last check, -1 before any.
++	int early_verify_result() const;
++
+ 	// A more refined version of decode_is_ready() that allows a bit more control.
+ 	// The default is num_pristine_bands = 2 (the next-to-final LL band) and minimum_packet_ratio = 0.9.
+ 	// active_block_mask is an optional pointer.
